@@ -1,0 +1,21 @@
+# Local editor / Claude Code config
+.claude/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Environment & configuration (may contain secrets / API config)
+.env
+config.json
+
+# Trading data & logs
+*.csv
+*.log
+
+# Kalshi & API Private Keys
+kalshi_private_key.key
+*.key
+*.pem
+*.pub
