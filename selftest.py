@@ -1170,6 +1170,128 @@ async def test_guardrails():
 
 
 # ---------------------------------------------------------------------------
+# 15) Asynchronous Discord alerting
+# ---------------------------------------------------------------------------
+
+def _rec_notifier():
+    """An ENABLED notifier whose 'sends' are recorded to a list (no network)."""
+    rec = []
+    n = lc.AlertNotifier("https://example.test/webhook",
+                         sender=lambda url, payload, timeout: rec.append(payload))
+    return n, rec
+
+
+async def test_alerting():
+    section("15) ASYNC DISCORD ALERTING")
+
+    # --- build_discord_payload: pure, limit-clamped, colour by level. ---
+    p = lc.build_discord_payload("Title", description="body",
+                                 fields=[("a", "1"), ("b", "2", False)],
+                                 level="critical")
+    emb = p["embeds"][0]
+    check("payload carries the username", p["username"], lc.ALERT_USERNAME)
+    check("critical maps to the red colour", emb["color"],
+          lc._ALERT_COLOR["critical"])
+    check("description is included", emb["description"], "body")
+    check("fields default to inline=True", emb["fields"][0]["inline"], True)
+    check("explicit inline=False is honoured", emb["fields"][1]["inline"], False)
+    long_title = "x" * 500
+    check("title is clamped to Discord's 256 limit",
+          len(lc.build_discord_payload(long_title)["embeds"][0]["title"]), 256)
+    check("an empty description is omitted",
+          "description" in lc.build_discord_payload("t")["embeds"][0], False)
+
+    # --- Disabled notifier (no URL): a pure no-op. ---
+    off = lc.AlertNotifier(None)
+    check("no URL → disabled", off.enabled, False)
+    off.notify("ignored"); off.flush(); off.close()
+    check("disabled notifier records nothing", off.sent, 0)
+
+    # --- Enabled notifier with a recording sender: dispatch + flush. ---
+    n, rec = _rec_notifier()
+    check("URL present → enabled", n.enabled, True)
+    n.notify("Hello", description="world", level="success")
+    n.notify("Second", fields=[("k", "v")])
+    n.flush()
+    check("both alerts were dispatched", len(rec), 2)
+    check("sent counter tracks deliveries", n.sent, 2)
+    check("first payload preserves the title", rec[0]["embeds"][0]["title"],
+          "Hello")
+    n.close()
+
+    # --- A failing sender is isolated: counted, never raised to the caller. ---
+    def _boom(url, payload, timeout):
+        raise RuntimeError("simulated webhook 500")
+    nf = lc.AlertNotifier("https://example.test/webhook", sender=_boom)
+    nf.notify("will fail")
+    nf.flush()
+    check("a sender failure increments the failed counter", nf.failed, 1)
+    check("a sender failure never reaches the caller (no crash)", nf.sent, 0)
+    nf.close()
+
+    # --- _summary_fields: the hourly/shutdown report body. ---
+    pf0 = lc.Portfolio([spec("SOL"), spec("WIF")], lc.PAPER_STAKE_USD)
+    names = [f[0] for f in lc._summary_fields(pf0, lc.time.monotonic())]
+    check("summary carries the core fields",
+          all(k in names for k in ("Uptime", "Total trades", "Session PnL",
+                                   "Open positions", "Per-symbol")), True)
+
+    # --- INTEGRATION: a circuit-breaker trip dispatches a critical alert. ---
+    n, rec = _rec_notifier()
+    pf = lc.Portfolio([spec("SOL")], lc.PAPER_STAKE_USD,
+                      circuit_breaker_enabled=True, max_consecutive_losses=1,
+                      notifier=n)
+    eng = pf.engines["SOL"]
+    _wire_book(eng.state, "binance", 100.00, 100.05)
+    _wire_book(eng.state, "bybit",   101.20, 101.25)
+    eng.gate.on_update("binance")                     # opens
+    pos = eng.ledger.open_trade
+    pos.funding_rate_per_sec = 1.0
+    pos.opened_at = lc.time.monotonic() - 10.0
+    _wire_book(eng.state, "bybit", 100.00, 100.04)    # converge → loss → trip
+    eng.gate.on_update("bybit")
+    n.flush()
+    trip = [pp for pp in rec if "CIRCUIT BREAKER" in pp["embeds"][0]["title"]]
+    check("a breaker trip dispatches a Discord alert", len(trip) >= 1, True)
+    check("the breaker alert is critical (red)",
+          trip[0]["embeds"][0]["color"] if trip else None,
+          lc._ALERT_COLOR["critical"])
+    n.close()
+
+    # --- INTEGRATION: an entry-time LEG-OUT dispatches a warning alert. ---
+    n, rec = _rec_notifier()
+    pf = lc.Portfolio([spec("SOL")], lc.PAPER_STAKE_USD,
+                      realism=_params(leg_failure_prob=1.0), notifier=n)
+    eng = pf.engines["SOL"]
+    _wire_book(eng.state, "binance", 100.00, 100.05)
+    _wire_book(eng.state, "bybit",   101.20, 101.25)   # fat edge → opens unhedged
+    eng.gate.on_update("binance")
+    n.flush()
+    legout = [pp for pp in rec if "LEG-OUT" in pp["embeds"][0]["title"]]
+    check("a legged-out trade dispatches a Discord alert", len(legout) >= 1, True)
+    check("the leg-out alert is a warning (orange)",
+          legout[0]["embeds"][0]["color"] if legout else None,
+          lc._ALERT_COLOR["warning"])
+    n.close()
+
+    # --- INTEGRATION: a reconciliation PANIC dispatches a critical alert. ---
+    n, rec = _rec_notifier()
+    pf = lc.Portfolio([spec("SOL")], lc.PAPER_STAKE_USD, notifier=n)
+    skewed = [lc.SimulatedBroker("Binance", lambda: 0.0),
+              lc.SimulatedBroker("Bybit", lambda: 0.0)]
+    guard = lc.ReconciliationGuard(pf, skewed, live=False, notifier=n)
+    await guard._reconcile_equity()                   # $100 gap ≫ tol → panic
+    n.flush()
+    panic = [pp for pp in rec if "PANIC" in pp["embeds"][0]["title"]
+             or "LIQUIDATION" in pp["embeds"][0]["title"]]
+    check("a panic close dispatches a Discord alert", len(panic) >= 1, True)
+    check("the panic alert is critical (red)",
+          panic[0]["embeds"][0]["color"] if panic else None,
+          lc._ALERT_COLOR["critical"])
+    n.close()
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1190,7 +1312,8 @@ async def _run_all():
               test_dynamic_config,
               test_execution_realism,
               test_config_editor,
-              test_guardrails):
+              test_guardrails,
+              test_alerting):
         await t()
     print(f"\n{BOLD}{'=' * 64}{RESET}")
     total = _PASS + _FAIL

@@ -51,6 +51,7 @@ import random
 import sys
 import threading
 import time
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -188,6 +189,22 @@ CB_MISSED_FILL_MIN_GAP_SEC = 1.0            # count a miss at most this often
 CB_EDGE_WINDOW = 5                          # rolling sample of realised edges
 CB_MIN_AVG_EDGE_BPS = 0.5                   # avg realised edge below this → halt
 
+# --- Asynchronous alerting (Discord webhook) -------------------------------
+# The webhook URL is a SECRET: read from the environment (or .env), never
+# hardcoded and never logged. Alerts are ACTIVE only when the URL is present;
+# otherwise the notifier degrades to a no-op so the bot runs identically.
+ALERT_WEBHOOK_ENV = "DISCORD_WEBHOOK_URL"   # env var holding the secret URL
+ALERT_SUMMARY_INTERVAL_SEC = 3600.0         # hourly trade/PnL summary cadence
+ALERT_HTTP_TIMEOUT_SEC = 5.0                # per-POST timeout (never block long)
+ALERT_USERNAME = "kalshi-poly arb"          # Discord webhook display name
+# Discord embed side-bar colours, keyed by severity level.
+_ALERT_COLOR = {
+    "critical": 0xE74C3C,   # red
+    "warning":  0xE67E22,   # orange
+    "info":     0x3498DB,   # blue
+    "success":  0x2ECC71,   # green
+}
+
 # Notional staked per simulated arbitrage (USD).
 PAPER_STAKE_USD = 100.0
 
@@ -230,6 +247,11 @@ def _ts_ms() -> str:
     """UTC ISO-8601 timestamp with MILLISECOND precision (diagnostic logs)."""
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+def _iso_now() -> str:
+    """Full ISO-8601 UTC timestamp (for Discord embed ``timestamp`` fields)."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _fmt(x) -> str:
@@ -301,6 +323,130 @@ def load_credentials(env_path: str = ".env") -> "ExchangeCredentials":
         okx_secret=os.environ.get("OKX_SECRET_KEY"),
         okx_passphrase=os.environ.get("OKX_PASSPHRASE"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Feature — asynchronous alerting (Discord webhook)
+#
+# A fire-and-forget notifier that pushes alerts (circuit-breaker trips, leg-out
+# liquidations, hourly summaries, lifecycle events) to a private Discord channel.
+# Modeled on TradeLogger: ``notify`` only does an O(1) ``queue.put_nowait`` (safe
+# to call from the asyncio event loop), while a daemon worker thread performs the
+# blocking HTTP POST — so network latency never stalls the trading loop, and a
+# webhook failure is logged + counted but NEVER propagates to crash the bot.
+# The secret webhook URL comes from the environment and is never logged.
+# ---------------------------------------------------------------------------
+
+def _http_post_json(url: str, payload: dict,
+                    timeout: float = ALERT_HTTP_TIMEOUT_SEC) -> None:
+    """POST a JSON body (Discord webhook). BLOCKING — only the notifier's worker
+    thread calls this, never the event loop."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "kalshi-poly-arb/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        resp.read()        # drain the body so the socket closes cleanly
+
+
+def build_discord_payload(title: str, description: str = "", fields=None,
+                          level: str = "info", username: str = ALERT_USERNAME,
+                          timestamp: "str | None" = None) -> dict:
+    """Pure builder: an alert → a Discord webhook JSON body (one rich embed).
+
+    Discord's hard limits are clamped (title 256, description 4096, ≤25 fields,
+    field name 256 / value 1024) so a payload is never rejected for length.
+    ``fields`` is an iterable of ``(name, value)`` or ``(name, value, inline)``.
+    """
+    embed = {"title": str(title)[:256],
+             "color": _ALERT_COLOR.get(level, _ALERT_COLOR["info"])}
+    if description:
+        embed["description"] = str(description)[:4096]
+    if timestamp:
+        embed["timestamp"] = timestamp
+    norm = []
+    for f in list(fields or [])[:25]:
+        name, value = f[0], f[1]
+        inline = f[2] if len(f) > 2 else True
+        norm.append({"name": str(name)[:256], "value": str(value)[:1024],
+                     "inline": bool(inline)})
+    if norm:
+        embed["fields"] = norm
+    return {"username": username, "embeds": [embed]}
+
+
+class AlertNotifier:
+    """Fire-and-forget Discord webhook alerter with a background worker thread.
+
+    Disabled (no thread; ``notify`` is a no-op) when no URL is configured, so the
+    bot behaves identically with or without alerting wired. ``sender`` is
+    injectable — tests pass a recorder so no real network call is ever made.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, webhook_url: "str | None" = None, *, enabled: bool = True,
+                 sender=None, username: str = ALERT_USERNAME,
+                 timeout: float = ALERT_HTTP_TIMEOUT_SEC) -> None:
+        self.url = webhook_url
+        self.enabled = bool(enabled and webhook_url)
+        self.username = username
+        self.timeout = float(timeout)
+        self._sender = sender or _http_post_json
+        self.sent = 0
+        self.failed = 0
+        self._q: "queue.Queue" = queue.Queue()
+        self._thread = None
+        if self.enabled:
+            self._thread = threading.Thread(
+                target=self._drain, name="alert-notifier", daemon=True)
+            self._thread.start()
+
+    def notify(self, title: str, *, description: str = "", fields=None,
+               level: str = "info") -> None:
+        """Enqueue an alert (non-blocking, hot-path safe). No-op when disabled."""
+        if not self.enabled:
+            return
+        payload = build_discord_payload(title, description, fields, level,
+                                        self.username, _iso_now())
+        self._q.put_nowait(payload)
+
+    def _drain(self) -> None:
+        while True:
+            item = self._q.get()
+            try:
+                if item is self._SENTINEL:
+                    return
+                self._sender(self.url, item, self.timeout)
+                self.sent += 1
+            except Exception as exc:        # delivery must NEVER crash the bot
+                self.failed += 1
+                # Log only the failure SHAPE — never the URL (it is the secret).
+                detail = getattr(exc, "code", None) or type(exc).__name__
+                print(YELLOW + f"[{_ts()}] ⚠️  alert delivery failed ({detail}) "
+                      f"— continuing." + RESET)
+            finally:
+                self._q.task_done()
+
+    def flush(self) -> None:
+        """Block until all queued alerts have been processed (best-effort)."""
+        if self.enabled:
+            self._q.join()
+
+    def close(self) -> None:
+        """Drain, stop the worker thread, and return (idempotent)."""
+        if not self.enabled or self._thread is None:
+            return
+        self._q.put_nowait(self._SENTINEL)
+        self._thread.join(timeout=5.0)
+
+
+def load_alert_notifier(sender=None) -> "AlertNotifier":
+    """Build an AlertNotifier from the environment. Alerts are ACTIVE iff
+    ``DISCORD_WEBHOOK_URL`` is set; otherwise a disabled no-op notifier is
+    returned. The URL is a secret — read from env/.env, never logged."""
+    return AlertNotifier(os.environ.get(ALERT_WEBHOOK_ENV), sender=sender)
 
 
 # ---------------------------------------------------------------------------
@@ -1416,7 +1562,8 @@ class _ArbGate:
                  logger: "TradeLogger | None" = None,
                  min_spread_bps: float = 0.0,
                  execution: "ExecutionModel | None" = None,
-                 breaker: "CircuitBreaker | None" = None) -> None:
+                 breaker: "CircuitBreaker | None" = None,
+                 notifier: "AlertNotifier | None" = None) -> None:
         self.state = state
         self.ledger = ledger
         self.stake = stake
@@ -1427,6 +1574,8 @@ class _ArbGate:
         self.execution = execution
         # Optional portfolio-wide circuit breaker. None → no breaker (tests).
         self.breaker = breaker
+        # Optional async alert notifier. None → no alerts (tests/offline).
+        self.notifier = notifier
         self.missed_fills = 0            # entries lost to slippage/latency/no-fill
         self.is_in_flight = False        # execution state lock
         self.last_trade_time = 0.0       # monotonic time of last exit (cooldown)
@@ -1544,6 +1693,22 @@ class _ArbGate:
                     extra += f" | PARTIAL {fill.fill_ratio*100:.0f}%"
                 if not fill.hedged:
                     extra += f" | {RED}⚠ UNHEDGED LEG{PURPLE}"
+                    # Immediate leg-out alert: a leg filled but its hedge did
+                    # not. The reconciliation guard will liquidate + halt if the
+                    # exposure persists past the grace window.
+                    if self.notifier is not None:
+                        self.notifier.notify(
+                            f"⚠️ LEG-OUT [{sym}]",
+                            description=(f"A leg filled on {best.direction} but "
+                                         f"its hedge did NOT — position is "
+                                         f"UNHEDGED. Auto-liquidation + halt will "
+                                         f"fire if it persists past the grace "
+                                         f"window."),
+                            level="warning",
+                            fields=[("Symbol", sym, True),
+                                    ("Direction", best.direction, True),
+                                    ("Buy @", _fmt_px(fill.exec_buy), True),
+                                    ("Sell @", _fmt_px(fill.exec_sell), True)])
                 buy_px, sell_px = fill.exec_buy, fill.exec_sell
             else:
                 extra = (f" | net {best.bps:+.2f} bps "
@@ -1653,6 +1818,25 @@ class _ArbGate:
         print(RED + "⛔   Trading PAUSED portfolio-wide (no new entries). "
               "Streams + dashboard stay live; restart after review." + RESET)
         print(RED + "⛔ " + "═" * 60 + RESET)
+        # Push an immediate critical alert (non-blocking) BEFORE latching halt.
+        if self.notifier is not None:
+            avg = d["avg_edge_bps"]
+            self.notifier.notify(
+                f"🚨 CIRCUIT BREAKER — {d['rule']}",
+                description=exc.detail,
+                level="critical",
+                fields=[
+                    ("Trigger", d["trigger_symbol"], True),
+                    ("Loss streak",
+                     f"{d['loss_streak']}/{d['max_consecutive_losses']}", True),
+                    ("Miss streak",
+                     f"{d['miss_streak']}/{d['max_missed_fill_streak']}", True),
+                    ("Avg edge",
+                     f"{avg:.2f} bps" if avg is not None else "n/a", True),
+                    ("Session trades", str(d["session_trade_count"]), True),
+                    ("Session PnL", f"${d['session_realized_pnl']:+.4f}", True),
+                    ("State", "HALTED portfolio-wide — paused, restart after "
+                              "review.", False)])
         if self.breaker is not None:
             self.breaker.latch_halt()
 
@@ -1702,12 +1886,14 @@ class Portfolio:
                  realism: "RealismParams | None" = None,
                  circuit_breaker_enabled: bool = False,
                  max_trades_per_min: int = CB_MAX_TRADES_PER_MIN,
-                 max_consecutive_losses: int = CB_MAX_CONSECUTIVE_LOSSES) -> None:
+                 max_consecutive_losses: int = CB_MAX_CONSECUTIVE_LOSSES,
+                 notifier: "AlertNotifier | None" = None) -> None:
         self.specs = list(specs)
         self.stake = stake
         self.logger = logger
         self.min_spread_bps = float(min_spread_bps)   # shared entry hurdle
         self.realism = realism
+        self.notifier = notifier                      # async alert sink (or None)
         # ONE portfolio-wide circuit breaker, shared by every symbol gate, so a
         # losing streak or runaway rate ANYWHERE trips a single global halt.
         # Disabled by default (tests/ad-hoc); ``run_live`` enables it.
@@ -1725,7 +1911,7 @@ class Portfolio:
             if realism is not None and realism.enabled:
                 execution = ExecutionModel(realism, seed=realism.seed + i)
             gate = _ArbGate(state, ledger, stake, logger, min_spread_bps,
-                            execution, breaker=self.breaker)
+                            execution, breaker=self.breaker, notifier=notifier)
             state.on_update = gate.on_update     # per-symbol frame → per-symbol gate
             self.engines[spec.name] = SymbolEngine(spec, state, ledger, gate)
         # Reverse lookups from each venue's wire identifier to our canonical name.
@@ -2168,7 +2354,8 @@ class ReconciliationGuard:
                  interval: float = RECONCILE_INTERVAL_SEC,
                  unhedged_grace: float = UNHEDGED_GRACE_SEC,
                  discrepancy_tol: float = DISCREPANCY_TOL_USD,
-                 initial_equity: float = INITIAL_EQUITY_USD) -> None:
+                 initial_equity: float = INITIAL_EQUITY_USD,
+                 notifier: "AlertNotifier | None" = None) -> None:
         self.portfolio = portfolio
         self.brokers = list(brokers)
         self.live = live
@@ -2178,6 +2365,7 @@ class ReconciliationGuard:
         self.initial_equity = float(initial_equity)   # baseline = order size
         self._last_reconcile = 0.0
         self.panicked = False
+        self.notifier = notifier                       # async alert sink (or None)
 
     async def loop(self, stop: asyncio.Event) -> None:
         self._last_reconcile = time.monotonic()   # first full reconcile after 1 interval
@@ -2228,6 +2416,22 @@ class ReconciliationGuard:
             return
         self.panicked = True
         send_alert(f"PANIC CLOSE TRIGGERED — {reason}")
+        # Immediate critical alert (non-blocking) — millisecond-stamped so a
+        # leg-out liquidation is timestamped precisely for the post-mortem.
+        if self.notifier is not None:
+            is_legout = "UNHEDGED" in reason
+            kind = ("EMERGENCY_LEG_OUT_LIQUIDATION" if is_legout
+                    else "PANIC_CLOSE")
+            self.notifier.notify(
+                f"🚨 {kind}",
+                description=reason,
+                level="critical",
+                fields=[("At", _ts_ms(), True),
+                        ("Session PnL",
+                         f"${self.portfolio.realized_pnl:+.4f}", True),
+                        ("Action", "All engines HALTED; paper positions closed. "
+                                   "Manual review required before restart.",
+                         False)])
         # 1) Latch EVERY symbol's kill-switch so no new entries open anywhere.
         self.portfolio.halt_all("panic")
         # 2) Force-close every open (paper) position across all symbols.
@@ -2297,6 +2501,51 @@ def _venue_status(portfolio: "Portfolio") -> str:
             mk = f"{GREEN}● ok{RESET}"
         cells.append(f"{label} {mk}")
     return "   ".join(cells)
+
+
+def _summary_fields(portfolio: "Portfolio", started_at: float):
+    """Build the Discord embed fields for a trade/PnL summary (pure → testable).
+
+    Used by the hourly report and the shutdown alert: totals, session PnL, open
+    positions, missed fills, uptime, and a per-symbol breakdown of any symbol
+    that traded or is currently in a position.
+    """
+    elapsed = max(0.0, time.monotonic() - started_at)
+    hrs, rem = divmod(int(elapsed), 3600)
+    mins, secs = divmod(rem, 60)
+    per = []
+    for name, eng in portfolio.engines.items():
+        if eng.ledger.trade_count or eng.ledger.open_trade is not None:
+            flag = " (open)" if eng.ledger.open_trade is not None else ""
+            per.append(f"{name}: {eng.ledger.trade_count} tr · "
+                       f"${eng.ledger.realized_pnl:+.4f}{flag}")
+    return [
+        ("Uptime", f"{hrs}h {mins:02d}m {secs:02d}s", True),
+        ("Total trades", str(portfolio.trade_count), True),
+        ("Session PnL", f"${portfolio.realized_pnl:+.4f}", True),
+        ("Open positions",
+         f"{len(portfolio.open_engines())}/{len(portfolio.engines)}", True),
+        ("Missed fills", str(portfolio.missed_fills), True),
+        ("Per-symbol", "\n".join(per) if per else "— no trades yet —", False),
+    ]
+
+
+async def _hourly_report_loop(portfolio: "Portfolio", notifier: "AlertNotifier",
+                              stop: asyncio.Event, started_at: float,
+                              interval: float = ALERT_SUMMARY_INTERVAL_SEC) -> None:
+    """Every ``interval`` seconds, push a trade/PnL summary to the notifier.
+
+    Uses ``_sleep_or_stop`` so a long (1h) wait still tears down promptly on
+    shutdown. Only scheduled when the notifier is active.
+    """
+    while not stop.is_set():
+        await _sleep_or_stop(interval, stop)
+        if stop.is_set():
+            break
+        notifier.notify("📊 Hourly summary",
+                        description="Periodic trade / PnL report.",
+                        fields=_summary_fields(portfolio, started_at),
+                        level="info")
 
 
 async def _dashboard_loop(portfolio: "Portfolio", stop: asyncio.Event) -> None:
@@ -2490,19 +2739,28 @@ async def run_live(config: "BotConfig",
     print(f"[{_ts()}] 📓 Trade journal → {trade_logger.path} "
           f"(append-only, flushed per trade)")
 
+    # Async Discord alerter — active iff DISCORD_WEBHOOK_URL is set. The URL is
+    # a secret and is NEVER printed; we only report enabled/disabled.
+    notifier = load_alert_notifier()
+    print(f"[{_ts()}] 🔔 Discord alerts: "
+          + (GREEN + "ENABLED ✓" + RESET if notifier.enabled
+             else f"disabled (set {ALERT_WEBHOOK_ENV} to enable)"))
+
     # One isolated engine per symbol (book + ledger + gate, per-symbol locks).
     # Trade size, the spread hurdle, and the execution-realism model all come
     # straight from the config.
     portfolio = Portfolio(specs, config.order_size_usd, logger=trade_logger,
                           min_spread_bps=config.min_spread_bps,
                           realism=config.realism,
-                          circuit_breaker_enabled=True)
+                          circuit_breaker_enabled=True,
+                          notifier=notifier)
     watchdog = StalenessWatchdog(portfolio, stale_threshold)
     portfolio.wire_ws_frame(watchdog.on_ws_frame)   # instant stale stand-down
     brokers = build_brokers(creds, portfolio, live,
                             initial_equity=config.order_size_usd)
     guard = ReconciliationGuard(portfolio, brokers, live=live,
-                                initial_equity=config.order_size_usd)
+                                initial_equity=config.order_size_usd,
+                                notifier=notifier)
 
     stop = asyncio.Event()
     started_at = time.monotonic()
@@ -2516,6 +2774,26 @@ async def run_live(config: "BotConfig",
         asyncio.create_task(guard.loop(stop), name="reconcile"),
         asyncio.create_task(_dashboard_loop(portfolio, stop), name="dashboard"),
     ]
+    # Hourly trade/PnL summary → Discord (only when alerting is active).
+    if notifier.enabled:
+        tasks.append(asyncio.create_task(
+            _hourly_report_loop(portfolio, notifier, stop, started_at),
+            name="hourly-report"))
+
+    # Lifecycle alert: the bot is online.
+    notifier.notify(
+        "✅ Arb bot online",
+        description=f"{'SIMULATION' if not live else 'LIVE'} · tracking "
+                    f"{len(specs)} symbols.",
+        level="success",
+        fields=[("Mode", "SIMULATION (dry-run)" if not live else "LIVE", True),
+                ("Symbols", symbols, True),
+                ("Order size",
+                 f"${config.order_size_usd:,.2f} (cap ${MAX_ORDER_USD:.2f})", True),
+                ("Guardrails",
+                 f"CB {CB_MAX_TRADES_PER_MIN}/{CB_WINDOW_SEC:.0f}s · "
+                 f"{CB_MAX_CONSECUTIVE_LOSSES}L · {CB_MAX_MISSED_FILL_STREAK}MF · "
+                 f"edge {CB_MIN_AVG_EDGE_BPS:.1f}bps", True)])
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -2528,6 +2806,13 @@ async def run_live(config: "BotConfig",
         # Always emit the summary and flush/close the journal on the way out,
         # whether we stopped cleanly or were cancelled by Ctrl-C.
         _print_session_summary(portfolio, trade_logger, started_at, live)
+        # Final lifecycle alert, then drain + stop the notifier thread.
+        notifier.notify("🛑 Arb bot stopped",
+                        description="Session ended — final report.",
+                        fields=_summary_fields(portfolio, started_at),
+                        level="info")
+        notifier.flush()
+        notifier.close()
         trade_logger.close()
 
 
