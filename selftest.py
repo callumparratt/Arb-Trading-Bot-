@@ -154,9 +154,9 @@ async def test_parsing_and_edge_math():
 # ---------------------------------------------------------------------------
 
 async def test_fee_buffer():
-    section("2) TAKER FEE BUFFER (0.05% x2)")
+    section("2) TAKER FEE BUFFER (0.10%/fill, entry+exit)")
 
-    # Round-trip fee on a ~60k book is ~0.10% ~= $60. A $20 gap can't clear it.
+    # Round-trip fee on a ~60k book is ~0.40% ~= $240. A $20 gap can't clear it.
     # Case A: narrow gap, swallowed by fees -> NO execution.
     state, ledger, gate = fresh_engine()
     state.update("binance", 60000.00, 60000.50)
@@ -674,14 +674,14 @@ async def test_dynamic_config():
     _os.remove(allbad)
 
     # --- min_spread_bps hurdle is ENFORCED by the gate. A positive net edge
-    #     (~5 bps) that clears the fee buffer but sits below a 50 bps hurdle
-    #     must be BLOCKED. ---
+    #     (~10 bps) that clears the round-trip fee buffer but sits below a 50 bps
+    #     hurdle must be BLOCKED. ---
     st = lc.PerpBookState(spec("SOL"))
     led = lc.Ledger()
     gate = lc._ArbGate(st, led, lc.PAPER_STAKE_USD, None, min_spread_bps=50.0)
     st.on_update = gate.on_update
     _wire_book(st, "binance", 100.00, 100.05)
-    _wire_book(st, "bybit",   100.20, 100.25)   # ~5 bps net — clears fees only
+    _wire_book(st, "bybit",   100.55, 100.60)   # ~10 bps net — clears fees only
     gate.on_update("binance")
     check("net edge below the configured hurdle is blocked",
           led.open_trade, None)
@@ -693,7 +693,7 @@ async def test_dynamic_config():
     gate2 = lc._ArbGate(st2, led2, lc.PAPER_STAKE_USD, None, min_spread_bps=0.0)
     st2.on_update = gate2.on_update
     _wire_book(st2, "binance", 100.00, 100.05)
-    _wire_book(st2, "bybit",   100.20, 100.25)
+    _wire_book(st2, "bybit",   100.55, 100.60)
     gate2.on_update("binance")
     check("same edge opens with a 0-bps hurdle",
           led2.open_trade is not None, True)
@@ -742,15 +742,17 @@ def _params(**over):
 async def test_execution_realism():
     section("12) EXECUTION REALISM (slippage / latency / partials / funding)")
 
-    # An ideal Binance→Bybit edge: gross 0.50 on ~100 (≈50 bps), fees ~10 bps.
-    edge = lc._edge("Binance→Bybit", "Binance", "Bybit", 100.00, 100.50)
+    # An ideal Binance→Bybit edge: gross ~1.50 on ~100 (≈150 bps), round-trip
+    # fees ~40 bps — wide enough that latency/slippage degrade but don't fully
+    # evaporate it (so the fills below stay non-None).
+    edge = lc._edge("Binance→Bybit", "Binance", "Bybit", 100.00, 101.50)
 
     # --- SLIPPAGE degrades the fill: buy higher, sell lower, net edge shrinks. ---
     m = lc.ExecutionModel(_params(slippage_bps=2.0), seed=7)
     fill = m.simulate_entry(edge, 100.0)
     check("slippage: a fill is still produced", fill is not None, True)
     check("slippage: buy leg fills ABOVE the ask", fill.exec_buy > 100.00, True)
-    check("slippage: sell leg fills BELOW the bid", fill.exec_sell < 100.50, True)
+    check("slippage: sell leg fills BELOW the bid", fill.exec_sell < 101.50, True)
     check("slippage: realised edge is worse than ideal",
           fill.per_unit < edge.per_unit, True)
     check("slippage: but still positive (didn't cross to a loss)",
@@ -973,6 +975,115 @@ async def test_config_editor():
 
 
 # ---------------------------------------------------------------------------
+# 14) Production guardrails: hard size cap + trading circuit breaker
+# ---------------------------------------------------------------------------
+
+async def test_guardrails():
+    section("14) GUARDRAILS (size cap + circuit breaker)")
+
+    # --- cap_order_size: pure clamp to the hard ceiling. ---
+    under, clamped = lc.cap_order_size(5.0)
+    check("size under ceiling passes through unchanged", under, 5.0)
+    check("under ceiling → not clamped", clamped, False)
+    at_v, at_c = lc.cap_order_size(lc.MAX_ORDER_USD)
+    check("size exactly at the ceiling is not clamped", at_c, False)
+    over_v, over_c = lc.cap_order_size(100.0)
+    check("size above ceiling clamps to MAX_ORDER_USD", over_v, lc.MAX_ORDER_USD)
+    check("above ceiling → clamped flag set", over_c, True)
+    check("hard ceiling is $10.50", lc.MAX_ORDER_USD, 10.50)
+
+    # --- Gate applies the cap BEFORE booking: opened notional ≤ ceiling. ---
+    st = lc.PerpBookState(spec("SOL"))
+    led = lc.Ledger()
+    gate = lc._ArbGate(st, led, lc.PAPER_STAKE_USD, None)   # stake $100, no breaker
+    st.on_update = gate.on_update
+    _wire_book(st, "binance", 100.00, 100.05)
+    _wire_book(st, "bybit",   101.20, 101.25)              # fat edge → opens
+    gate.on_update("binance")
+    check("size guard: a position still opens on a fat edge",
+          led.open_trade is not None, True)
+    check("size guard: opened notional clamped to the $10.50 ceiling",
+          led.open_trade.notional <= lc.MAX_ORDER_USD + 1e-6, True)
+
+    # --- CircuitBreaker RATE LIMIT: trips on the (cap+1)th entry in-window. ---
+    pf = lc.Portfolio([spec("SOL")], lc.PAPER_STAKE_USD)
+    cb = lc.CircuitBreaker(pf, enabled=True, max_trades_per_min=3, window_sec=60.0)
+    for _ in range(3):
+        cb.check_rate("SOL")        # under the cap → OK
+        cb.record_trade()
+    rate_trip, rate_rule, diag = False, None, None
+    try:
+        cb.check_rate("SOL")        # 4th: window already at cap → trip
+    except lc.CircuitBreakerTripped as exc:
+        rate_trip, rate_rule, diag = True, exc.rule, exc.diagnostic
+    check("rate limit trips on the 4th entry in-window", rate_trip, True)
+    check("rate-limit trip carries the RATE_LIMIT rule", rate_rule, "RATE_LIMIT")
+    check("trip exposes a diagnostic snapshot (dict)", isinstance(diag, dict), True)
+    check("diagnostic stamps a millisecond UTC timestamp",
+          diag is not None and diag["ts_utc_ms"].endswith("Z"), True)
+    check("breaker latched as tripped", cb.tripped, True)
+
+    # --- CircuitBreaker CONSECUTIVE LOSSES: a win resets the streak. ---
+    cb2 = lc.CircuitBreaker(pf, enabled=True, max_consecutive_losses=3)
+    cb2.record_result(-1.0, "SOL")          # streak 1
+    cb2.record_result(5.0, "SOL")           # WIN → reset to 0
+    cb2.record_result(-1.0, "SOL")          # streak 1
+    early = False
+    try:
+        cb2.record_result(-1.0, "SOL")      # streak 2 (would be 3 w/o the reset)
+    except lc.CircuitBreakerTripped:
+        early = True
+    check("a winning trade reset the loss streak (no early trip)", early, False)
+    loss_trip, loss_rule = False, None
+    try:
+        cb2.record_result(-1.0, "SOL")      # streak 3 → trip
+    except lc.CircuitBreakerTripped as exc:
+        loss_trip, loss_rule = True, exc.rule
+    check("3 consecutive losses trips the breaker", loss_trip, True)
+    check("loss trip carries the CONSECUTIVE_LOSSES rule",
+          loss_rule, "CONSECUTIVE_LOSSES")
+
+    # --- Disabled breaker NEVER trips (default for tests/ad-hoc engines). ---
+    cb_off = lc.CircuitBreaker(pf, enabled=False, max_consecutive_losses=1)
+    quiet = True
+    try:
+        cb_off.record_result(-1.0, "SOL")
+        cb_off.record_result(-1.0, "SOL")
+        cb_off.check_rate("SOL")
+    except lc.CircuitBreakerTripped:
+        quiet = False
+    check("disabled breaker never trips", quiet, True)
+    check("Portfolio breaker is disabled by default",
+          lc.Portfolio([spec("SOL")], lc.PAPER_STAKE_USD).breaker.enabled, False)
+
+    # --- INTEGRATION: a losing round-trip through the gate trips + HALTS, and
+    #     the loop pauses (no crash) — subsequent entries are refused. ---
+    pf2 = lc.Portfolio([spec("SOL")], lc.PAPER_STAKE_USD,
+                       circuit_breaker_enabled=True, max_consecutive_losses=1)
+    eng = pf2.engines["SOL"]
+    _wire_book(eng.state, "binance", 100.00, 100.05)
+    _wire_book(eng.state, "bybit",   101.20, 101.25)      # fat edge → opens
+    eng.gate.on_update("binance")
+    check("integration: a position opened under the live breaker",
+          eng.ledger.open_trade is not None, True)
+    # Force this round-trip to CLOSE at a loss: absurd funding over a long hold.
+    pos = eng.ledger.open_trade
+    pos.funding_rate_per_sec = 1.0
+    pos.opened_at = lc.time.monotonic() - 10.0
+    _wire_book(eng.state, "bybit", 100.00, 100.04)        # converged → exit
+    eng.gate.on_update("bybit")                           # close → loss → trip
+    check("integration: the losing round-trip was booked",
+          eng.ledger.trade_count, 1)
+    check("integration: breaker tripped on the loss", pf2.breaker.tripped, True)
+    check("integration: portfolio HALTED after the trip", eng.gate.halted, True)
+    # Paused, not crashed: a fresh fat frame must now be refused.
+    _wire_book(eng.state, "bybit", 101.80, 101.85)
+    eng.gate.on_update("bybit")
+    check("integration: halted engine refuses new entries (paused cleanly)",
+          eng.ledger.open_trade, None)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -992,7 +1103,8 @@ async def _run_all():
               test_trade_journal,
               test_dynamic_config,
               test_execution_realism,
-              test_config_editor):
+              test_config_editor,
+              test_guardrails):
         await t()
     print(f"\n{BOLD}{'=' * 64}{RESET}")
     total = _PASS + _FAIL

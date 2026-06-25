@@ -51,6 +51,7 @@ import random
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -145,8 +146,36 @@ def okx_subscribe(specs) -> dict:
             "args": [{"channel": "bbo-tbt", "instId": s.okx} for s in specs]}
 
 
-# Standard taker fee buffer applied to BOTH legs of the round trip (0.05%).
-TAKER_FEE = 0.0005
+# --- Taker fees ------------------------------------------------------------
+# Standard exchange taker rate charged on EVERY fill (0.10%). A complete
+# arbitrage round-trip fills each leg TWICE — once to OPEN (buy venue-A /
+# sell venue-B) and once to CLOSE (sell venue-A / buy venue-B on convergence) —
+# so the taker cost the edge math must charge PER LEG is entry + exit = 2× the
+# per-fill rate. ``TAKER_FEE`` therefore stays the single per-leg constant used
+# structurally in the edge formula, now valued at the full round-trip cost.
+#
+# NOTE: this is a *simulation* fee assumption only. Nothing here debits a real
+# balance — all fills are paper (see SimulatedBroker / dry_run). Live venue
+# fee tiers / native discounts (e.g. BNB on Binance) would be reconciled by the
+# authenticated layer, which is a deliberately-unimplemented stub.
+TAKER_FEE_PER_FILL = 0.001                 # 0.10% taker, charged on every fill
+TAKER_FEE = 2.0 * TAKER_FEE_PER_FILL       # entry + exit ⇒ round-trip per leg
+
+# --- Hard order-size ceiling (defence-in-depth) ----------------------------
+# A strict physical per-clip ceiling (USD). Every intended stake is clamped to
+# this BEFORE it can touch the simulated ledger, so no arithmetic blow-up can
+# size a clip past the ceiling — even though dry-run never sends a real order.
+MAX_ORDER_USD = 10.50                       # hard cap: no clip may exceed this
+ORDER_WARN_USD = 11.00                      # above this → a LOUD clamp warning
+
+# --- Circuit-breaker thresholds --------------------------------------------
+# Strict trading circuit breaker. Tripping LATCHES a portfolio-wide halt (no
+# new entries) and pauses the trading loop WITHOUT killing the process, so the
+# streams + dashboard stay live for inspection. Tuned generously so normal
+# operation never trips, but a runaway loop or a losing streak does.
+CB_WINDOW_SEC = 60.0                        # rolling window for the rate limit
+CB_MAX_TRADES_PER_MIN = 30                  # max entries opened per window
+CB_MAX_CONSECUTIVE_LOSSES = 3               # consecutive losing round-trips → halt
 
 # Notional staked per simulated arbitrage (USD).
 PAPER_STAKE_USD = 100.0
@@ -184,6 +213,12 @@ RED = "\033[91m"
 
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
+def _ts_ms() -> str:
+    """UTC ISO-8601 timestamp with MILLISECOND precision (diagnostic logs)."""
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
 def _fmt(x) -> str:
@@ -277,7 +312,7 @@ class RealismParams:
     driven adverse selection, occasional missed / partial fills, the odd failed
     leg (→ unhedged exposure), and perp funding accrual over the hold.
     """
-    enabled: bool = True              # master switch for the whole layer
+    enabled: bool = False             # master switch (OFF ⇒ idealised fills)
     # Per-effect ON/OFF switches. Independent of the magnitudes below, so any
     # single friction can be silenced WITHOUT losing its tuned value. All ON by
     # default; an effect bites only when BOTH ``enabled`` and its switch are on.
@@ -289,8 +324,9 @@ class RealismParams:
     funding: bool = True               # gates funding_rate_8h_bps
     # Magnitudes.
     slippage_bps: float = 1.0          # taker slip past top-of-book, per leg
+    slippage_mult: float = 1.0         # adjustable multiplier on slippage_bps
     impact_bps_per_10k: float = 2.5    # extra bps of impact per $10k of size
-    latency_ms: float = 15.0            # signal→fill wire time
+    latency_ms: float = 230.0            # signal→fill wire time
     latency_adverse_bps: float = 0.5   # worst-case adverse drift per 100ms
     fill_probability: float = 0.88      # P(the resting quote is still there)
     partial_fill_prob: float = 0.05     # P(we only get part of the size)
@@ -427,6 +463,7 @@ def _parse_realism(raw: dict) -> "RealismParams":
         leg_failure=flag("leg_failure"),
         funding=flag("funding"),
         slippage_bps=num("slippage_bps", 0.0),
+        slippage_mult=num("slippage_mult", 1.0),
         impact_bps_per_10k=num("impact_bps_per_10k", 0.0),
         latency_ms=num("latency_ms", 0.0),
         latency_adverse_bps=num("latency_adverse_bps", 0.0),
@@ -499,7 +536,8 @@ REALISM_EFFECTS = ("slippage", "latency", "missed_fills", "partial_fills",
                    "leg_failure", "funding")
 
 _TOP_KEYS = {"dry_run", "order_size_usd", "min_spread_bps", "target_markets"}
-_REALISM_KEYS = ({"enabled", "seed", "slippage_bps", "impact_bps_per_10k",
+_REALISM_KEYS = ({"enabled", "seed", "slippage_bps", "slippage_mult",
+                  "impact_bps_per_10k",
                   "latency_ms", "latency_adverse_bps", "fill_probability",
                   "partial_fill_prob", "partial_fill_min_ratio",
                   "leg_failure_prob", "funding_rate_8h_bps"}
@@ -517,7 +555,7 @@ def _default_config_dict() -> dict:
             "enabled": True,
             "slippage": True, "latency": True, "missed_fills": True,
             "partial_fills": True, "leg_failure": True, "funding": True,
-            "slippage_bps": 1.5, "impact_bps_per_10k": 0.8,
+            "slippage_bps": 1.0, "slippage_mult": 5.0, "impact_bps_per_10k": 0.8,
             "latency_ms": 250.0, "latency_adverse_bps": 0.6,
             "fill_probability": 0.97, "partial_fill_prob": 0.15,
             "partial_fill_min_ratio": 0.5, "leg_failure_prob": 0.02,
@@ -578,12 +616,16 @@ def _print_config(cfg: "BotConfig") -> None:
     print(f" source          : {cfg.source}")
     print(f" dry_run         : {cfg.dry_run}   "
           f"({'SIMULATION' if cfg.dry_run else 'LIVE'})")
-    print(f" order_size_usd  : {cfg.order_size_usd:,.2f}")
+    capped_note = (f"  → CLAMPED to {MAX_ORDER_USD:.2f} (hard ceiling)"
+                   if cfg.order_size_usd > MAX_ORDER_USD else "")
+    print(f" order_size_usd  : {cfg.order_size_usd:,.2f}{capped_note}")
     print(f" min_spread_bps  : {cfg.min_spread_bps:.2f}")
     print(f" target_markets  : {', '.join(cfg.target_markets)}")
     print(f" realism.enabled : {on(rp.enabled)} (master)")
     print(f"   {'slippage':<14}{on(rp.slippage)}  "
-          f"{rp.slippage_bps:.2f}bps + {rp.impact_bps_per_10k:.2f}bps/$10k")
+          f"{rp.slippage_bps:.2f}×{rp.slippage_mult:.2f}"
+          f"={rp.slippage_bps*rp.slippage_mult:.2f}bps "
+          f"+ {rp.impact_bps_per_10k:.2f}bps/$10k")
     print(f"   {'latency':<14}{on(rp.latency)}  "
           f"{rp.latency_ms:.0f}ms ±{rp.latency_adverse_bps:.2f}bps/100ms")
     print(f"   {'missed_fills':<14}{on(rp.missed_fills)}  "
@@ -1062,7 +1104,7 @@ class ExecutionModel:
         # Per-effect toggles collapse a disabled effect to its no-op value while
         # the RNG is still drawn in a fixed order (so toggling one effect doesn't
         # disturb the others' reproducible stream).
-        slip_bps = p.slippage_bps if p.slippage else 0.0
+        slip_bps = (p.slippage_bps * p.slippage_mult) if p.slippage else 0.0
         impact_per_10k = p.impact_bps_per_10k if p.slippage else 0.0
         lat_adverse = p.latency_adverse_bps if p.latency else 0.0
         fill_prob = p.fill_probability if p.missed_fills else 1.0
@@ -1117,6 +1159,155 @@ class ExecutionModel:
 
 
 # ---------------------------------------------------------------------------
+# Production guardrails — hard order-size ceiling + trading circuit breaker
+#
+# These intercept a trade request BEFORE it can mutate the simulated ledger.
+# Nothing here transmits a real order (the broker layer stays mocked); they are
+# defence-in-depth so the paper engine already behaves like a risk-managed live
+# one — the guardrails are validated in simulation before any live wiring.
+# ---------------------------------------------------------------------------
+
+def cap_order_size(requested_usd: float) -> "tuple[float, bool]":
+    """Clamp a per-clip stake to the hard ``MAX_ORDER_USD`` ceiling.
+
+    Returns ``(capped_usd, clamped)`` — ``clamped`` is True iff the request
+    exceeded the ceiling and was scaled back. Pure and side-effect free, so it
+    is trivially unit-testable and safe to call on the per-frame hot path.
+    """
+    if requested_usd > MAX_ORDER_USD:
+        return MAX_ORDER_USD, True
+    return requested_usd, False
+
+
+class CircuitBreakerTripped(RuntimeError):
+    """Raised the instant a circuit-breaker rule trips.
+
+    Carries a structured ``diagnostic`` snapshot of the EXACT engine state at
+    the moment of the trip, so the operator log can be highly detailed. It is
+    raised from the per-frame execution path and CAUGHT by ``_ArbGate.on_update``
+    — which logs it and latches a clean portfolio-wide halt. The process is
+    never killed, so the streams + dashboard stay live for inspection.
+    """
+
+    def __init__(self, rule: str, detail: str, diagnostic: dict) -> None:
+        super().__init__(f"[{rule}] {detail}")
+        self.rule = rule
+        self.detail = detail
+        self.diagnostic = diagnostic
+
+
+class CircuitBreaker:
+    """Portfolio-wide trading circuit breaker (shared by every symbol gate).
+
+    Two independent rules, either of which trips ONE global halt:
+
+      * RATE LIMIT        — more than ``max_trades_per_min`` entries opened
+                            within a rolling ``window_sec`` window (runaway loop).
+      * CONSECUTIVE LOSS  — ``max_consecutive_losses`` losing round-trips in a row.
+
+    Disabled by default (``enabled=False``) so ad-hoc engines and unit tests are
+    unaffected; ``run_live`` constructs it enabled. Every clock is monotonic, so
+    it is immune to wall-clock jumps.
+    """
+
+    def __init__(self, portfolio, *, enabled: bool = False,
+                 max_trades_per_min: int = CB_MAX_TRADES_PER_MIN,
+                 max_consecutive_losses: int = CB_MAX_CONSECUTIVE_LOSSES,
+                 window_sec: float = CB_WINDOW_SEC) -> None:
+        self.portfolio = portfolio
+        self.enabled = bool(enabled)
+        self.max_trades_per_min = int(max_trades_per_min)
+        self.max_consecutive_losses = int(max_consecutive_losses)
+        self.window_sec = float(window_sec)
+        self.tripped = False
+        self._trade_times = deque()     # monotonic stamps of recent entries
+        self._loss_streak = 0
+
+    # --- rate limit --------------------------------------------------------
+    def _evict(self, now: float) -> None:
+        w = self._trade_times
+        while w and now - w[0] > self.window_sec:
+            w.popleft()
+
+    def check_rate(self, symbol: str) -> None:
+        """Pre-entry gate: trip if the rolling window is already at the cap.
+
+        Called BEFORE the ledger is touched, so a tripped rate limit refuses the
+        entry outright (intercept before state mutation).
+        """
+        if not self.enabled or self.tripped:
+            return
+        now = time.monotonic()
+        self._evict(now)
+        if len(self._trade_times) >= self.max_trades_per_min:
+            raise self._trip(
+                "RATE_LIMIT",
+                f"{len(self._trade_times)} entries within the last "
+                f"{self.window_sec:.0f}s hit the cap of "
+                f"{self.max_trades_per_min}/window — refusing new entries",
+                symbol)
+
+    def record_trade(self) -> None:
+        """Count a position that actually opened toward the rate window."""
+        if not self.enabled:
+            return
+        self._trade_times.append(time.monotonic())
+
+    # --- consecutive losses ------------------------------------------------
+    def record_result(self, pnl: float, symbol: str) -> None:
+        """Post-close: update the loss streak and trip on a run of losers."""
+        if not self.enabled or self.tripped:
+            return
+        if pnl < 0.0:
+            self._loss_streak += 1
+        else:
+            self._loss_streak = 0
+        if self._loss_streak >= self.max_consecutive_losses:
+            raise self._trip(
+                "CONSECUTIVE_LOSSES",
+                f"{self._loss_streak} consecutive losing round-trips hit the "
+                f"cap of {self.max_consecutive_losses}",
+                symbol)
+
+    # --- trip + halt -------------------------------------------------------
+    def _trip(self, rule: str, detail: str,
+              symbol: str) -> "CircuitBreakerTripped":
+        self.tripped = True
+        return CircuitBreakerTripped(rule, detail,
+                                     self._snapshot(rule, detail, symbol))
+
+    def latch_halt(self) -> None:
+        """Latch the portfolio-wide kill-switch (no new entries anywhere)."""
+        self.portfolio.halt_all("circuit-breaker")
+
+    def _snapshot(self, rule: str, detail: str, symbol: str) -> dict:
+        """Capture the EXACT engine state at the trip (for the diagnostic log)."""
+        per_symbol = {}
+        for name, eng in getattr(self.portfolio, "engines", {}).items():
+            per_symbol[name] = {
+                "status": eng.status,
+                "open": eng.ledger.open_trade is not None,
+                "realized_pnl": round(eng.ledger.realized_pnl, 6),
+                "trades": eng.ledger.trade_count,
+            }
+        return {
+            "ts_utc_ms": _ts_ms(),
+            "rule": rule,
+            "detail": detail,
+            "trigger_symbol": symbol,
+            "loss_streak": self._loss_streak,
+            "max_consecutive_losses": self.max_consecutive_losses,
+            "trades_in_window": len(self._trade_times),
+            "max_trades_per_min": self.max_trades_per_min,
+            "window_sec": self.window_sec,
+            "session_realized_pnl": round(
+                getattr(self.portfolio, "realized_pnl", 0.0), 6),
+            "session_trade_count": getattr(self.portfolio, "trade_count", 0),
+            "per_symbol": per_symbol,
+        }
+
+
+# ---------------------------------------------------------------------------
 # The fee-gated arbitrage engine (execution state lock + monotonic cooldown)
 # ---------------------------------------------------------------------------
 
@@ -1142,7 +1333,8 @@ class _ArbGate:
     def __init__(self, state: "PerpBookState", ledger: "Ledger", stake: float,
                  logger: "TradeLogger | None" = None,
                  min_spread_bps: float = 0.0,
-                 execution: "ExecutionModel | None" = None) -> None:
+                 execution: "ExecutionModel | None" = None,
+                 breaker: "CircuitBreaker | None" = None) -> None:
         self.state = state
         self.ledger = ledger
         self.stake = stake
@@ -1151,12 +1343,15 @@ class _ArbGate:
         self.min_spread_bps = float(min_spread_bps)
         # Optional execution-realism model. None → idealised top-of-book fills.
         self.execution = execution
+        # Optional portfolio-wide circuit breaker. None → no breaker (tests).
+        self.breaker = breaker
         self.missed_fills = 0            # entries lost to slippage/latency/no-fill
         self.is_in_flight = False        # execution state lock
         self.last_trade_time = 0.0       # monotonic time of last exit (cooldown)
         self.halted = False              # hard kill-switch set by a panic close
         self._last_block_log = 0.0
         self._block_interval = 2.0       # seconds between repeat "blocked" lines
+        self._last_size_warn = 0.0       # throttle for the size-cap warning
 
     def release(self, reason: str = "shutdown") -> None:
         """Clear the execution lock (e.g. on teardown)."""
@@ -1168,7 +1363,18 @@ class _ArbGate:
         self.is_in_flight = False
 
     def on_update(self, feed: str) -> None:
+        """Per-frame entry point. A guardrail trip raises CircuitBreakerTripped
+        from deep in the evaluation; we catch it HERE so the breaker cleanly
+        pauses trading (a portfolio-wide halt) WITHOUT crashing the stream task
+        that drives this callback."""
+        try:
+            self._evaluate_frame(feed)
+        except CircuitBreakerTripped as exc:
+            self._handle_breaker_trip(exc)
+
+    def _evaluate_frame(self, feed: str) -> None:
         st, led = self.state, self.ledger
+        sym = st.spec.name if st.spec else "?"
 
         # --- LOCKED: a position is in flight. Manage ONLY the exit; suppress
         # every new entry on subsequent high-frequency frames. ---
@@ -1189,6 +1395,10 @@ class _ArbGate:
                           f"[{_ts()}] ✅ SPREAD CONVERGED — closed {pos.direction} "
                           f"| locked PnL ${pnl:+.4f} | session ${led.realized_pnl:+.4f}"
                           + RESET)
+                    # Feed the realised PnL to the breaker AFTER the close is
+                    # booked; a run of losers trips it (raises) right here.
+                    if self.breaker is not None:
+                        self.breaker.record_result(pnl, sym)
             else:
                 # Defensive: position vanished without a close. Release the lock.
                 self.is_in_flight = False
@@ -1208,16 +1418,21 @@ class _ArbGate:
         if not edges:
             return
         best = edges[0]
-        sym = st.spec.name if st.spec else "?"
         # Entry requires a POSITIVE net-of-fee edge that ALSO clears the
         # configured spread hurdle (min_spread_bps). With the hurdle at 0 this
         # is exactly the original "any positive net edge trades" behaviour.
         if best.is_open and best.bps >= self.min_spread_bps:
+            # GUARDRAIL INTERCEPTION (before ANY ledger mutation):
+            #   1) rate-limit: refuse/halt if we have already traded too fast;
+            #   2) hard size cap: clamp this clip's stake to the ceiling.
+            if self.breaker is not None:
+                self.breaker.check_rate(sym)         # raises → caught in on_update
+            stake = self._guarded_stake(sym)
             # Route the intended entry through the execution-realism model (if
             # any). It can degrade or REJECT the fill (slippage/latency/no-fill).
             fill = None
             if self.execution is not None:
-                fill = self.execution.simulate_entry(best, self.stake)
+                fill = self.execution.simulate_entry(best, stake)
                 if fill is None:
                     self.missed_fills += 1
                     now = time.monotonic()
@@ -1228,9 +1443,12 @@ class _ArbGate:
                               f"{best.bps:+.2f} bps — quote pulled or slippage/"
                               f"latency erased the edge." + RESET)
                     return
-            led.open_position(best, self.stake, fill=fill)
+            led.open_position(best, stake, fill=fill)
             if led.open_trade is not None:
                 self.is_in_flight = True   # engage the lock immediately
+                # Count the opened entry toward the breaker's rate window.
+                if self.breaker is not None:
+                    self.breaker.record_trade()
             # Build a realism annotation for the alert (slip / partial / unhedged).
             if fill is not None:
                 shown_bps = (fill.per_unit / fill.exec_buy * 1e4
@@ -1244,7 +1462,7 @@ class _ArbGate:
             else:
                 extra = (f" | net {best.bps:+.2f} bps "
                          f"(${best.per_unit:+.6f}/unit after "
-                         f"{TAKER_FEE*1e2:.2f}% x2 taker)")
+                         f"{TAKER_FEE_PER_FILL*1e2:.2f}%/fill entry+exit taker)")
                 buy_px, sell_px = best.buy_ask, best.sell_bid
             print(PURPLE +
                   f"[{_ts()}] 🚨 ARB SPREAD FOUND! [{sym}] {best.direction} "
@@ -1296,6 +1514,49 @@ class _ArbGate:
                 return e
         return None
 
+    def _guarded_stake(self, sym: str) -> float:
+        """Apply the hard order-size ceiling to this clip's stake.
+
+        Intercepts BEFORE the ledger is touched. Warns (throttled, with a louder
+        RED line past ``ORDER_WARN_USD``) whenever the configured size has to be
+        scaled back to the ``MAX_ORDER_USD`` ceiling.
+        """
+        capped, clamped = cap_order_size(self.stake)
+        if clamped:
+            now = time.monotonic()
+            if now - self._last_size_warn >= self._block_interval:
+                self._last_size_warn = now
+                sev = RED if self.stake > ORDER_WARN_USD else YELLOW
+                print(sev +
+                      f"[{_ts()}] ⚠️  ORDER-SIZE GUARD [{sym}] requested "
+                      f"${self.stake:,.2f} exceeds the ${MAX_ORDER_USD:.2f} hard "
+                      f"ceiling — clamped to ${capped:.2f} per clip." + RESET)
+        return capped
+
+    def _handle_breaker_trip(self, exc: "CircuitBreakerTripped") -> None:
+        """A circuit-breaker rule tripped: emit a highly-detailed diagnostic,
+        latch a portfolio-wide halt, and PAUSE — never crash the process."""
+        d = exc.diagnostic
+        print(RED + "⛔ " + "═" * 60 + RESET)
+        print(RED + f"⛔ CIRCUIT BREAKER TRIPPED [{d['rule']}] at "
+              f"{d['ts_utc_ms']}" + RESET)
+        print(RED + f"⛔   {exc.detail}" + RESET)
+        print(RED + f"⛔   trigger={d['trigger_symbol']} · loss_streak="
+              f"{d['loss_streak']}/{d['max_consecutive_losses']} · window="
+              f"{d['trades_in_window']}/{d['max_trades_per_min']} per "
+              f"{d['window_sec']:.0f}s" + RESET)
+        print(RED + f"⛔   session: {d['session_trade_count']} trade(s), "
+              f"realized ${d['session_realized_pnl']:+.4f}" + RESET)
+        for name, snap in d["per_symbol"].items():
+            print(RED + f"⛔     {name:<6} {snap['status']:<14} "
+                  f"open={str(snap['open']):<5} trades={snap['trades']:<3} "
+                  f"pnl=${snap['realized_pnl']:+.4f}" + RESET)
+        print(RED + "⛔   Trading PAUSED portfolio-wide (no new entries). "
+              "Streams + dashboard stay live; restart after review." + RESET)
+        print(RED + "⛔ " + "═" * 60 + RESET)
+        if self.breaker is not None:
+            self.breaker.latch_halt()
+
 
 # ---------------------------------------------------------------------------
 # Multi-symbol portfolio: one independent engine (book + ledger + gate) per
@@ -1339,12 +1600,22 @@ class Portfolio:
     def __init__(self, specs, stake: float,
                  logger: "TradeLogger | None" = None,
                  min_spread_bps: float = 0.0,
-                 realism: "RealismParams | None" = None) -> None:
+                 realism: "RealismParams | None" = None,
+                 circuit_breaker_enabled: bool = False,
+                 max_trades_per_min: int = CB_MAX_TRADES_PER_MIN,
+                 max_consecutive_losses: int = CB_MAX_CONSECUTIVE_LOSSES) -> None:
         self.specs = list(specs)
         self.stake = stake
         self.logger = logger
         self.min_spread_bps = float(min_spread_bps)   # shared entry hurdle
         self.realism = realism
+        # ONE portfolio-wide circuit breaker, shared by every symbol gate, so a
+        # losing streak or runaway rate ANYWHERE trips a single global halt.
+        # Disabled by default (tests/ad-hoc); ``run_live`` enables it.
+        self.breaker = CircuitBreaker(
+            self, enabled=circuit_breaker_enabled,
+            max_trades_per_min=max_trades_per_min,
+            max_consecutive_losses=max_consecutive_losses)
         self.engines = {}
         for i, spec in enumerate(self.specs):
             state = PerpBookState(spec)
@@ -1355,7 +1626,7 @@ class Portfolio:
             if realism is not None and realism.enabled:
                 execution = ExecutionModel(realism, seed=realism.seed + i)
             gate = _ArbGate(state, ledger, stake, logger, min_spread_bps,
-                            execution)
+                            execution, breaker=self.breaker)
             state.on_update = gate.on_update     # per-symbol frame → per-symbol gate
             self.engines[spec.name] = SymbolEngine(spec, state, ledger, gate)
         # Reverse lookups from each venue's wire identifier to our canonical name.
@@ -1966,7 +2237,8 @@ async def _dashboard_loop(portfolio: "Portfolio", stop: asyncio.Event) -> None:
                          eng.ledger.realized_pnl))
 
         print(f"\n┌─ [{_ts()}] MULTI-ASSET PERP ARB · {n} symbols · "
-              f"Binance ⇄ Bybit ⇄ OKX · taker {TAKER_FEE*1e2:.2f}%×2 ─")
+              f"Binance ⇄ Bybit ⇄ OKX · taker {TAKER_FEE_PER_FILL*1e2:.2f}%"
+              f"/fill ×4 (entry+exit) ─")
         print(f"│ venues  {_venue_status(portfolio)}")
         print(f"│ {'ASSET':<6}{'best bid':>14}{'best ask':>14}  {'B/Y/O':<7}"
               f"{'maxNet(bps)':>13}  {'state':<12}{'pnl($)':>10}")
@@ -2056,7 +2328,8 @@ async def run_live(config: "BotConfig",
         print(f" Realism: ON (seed {rp.seed}) · "
               + " ".join([
                   _eff("slip", rp.slippage,
-                       f"{rp.slippage_bps:.1f}+{rp.impact_bps_per_10k:.1f}/$10k bps"),
+                       f"{rp.slippage_bps:.1f}×{rp.slippage_mult:.1f}"
+                       f"+{rp.impact_bps_per_10k:.1f}/$10k bps"),
                   _eff("latency", rp.latency,
                        f"{rp.latency_ms:.0f}ms ±{rp.latency_adverse_bps:.1f}/100ms"),
                   _eff("miss", rp.missed_fills, f"p={rp.fill_probability:.2f}"),
@@ -2066,8 +2339,15 @@ async def run_live(config: "BotConfig",
               ]))
     else:
         print(" Realism: OFF (idealised top-of-book fills)")
-    print(f" Taker buffer {TAKER_FEE*1e2:.2f}% per leg · "
+    print(f" Taker buffer {TAKER_FEE_PER_FILL*1e2:.2f}%/fill (entry+exit ⇒ "
+          f"{TAKER_FEE*1e2:.2f}% round-trip per leg) · "
           f"stale flag after {stale_threshold:0.0f}s of silence")
+    size_note = (f"  ⚠ order ${config.order_size_usd:,.2f} > ceiling — every "
+                 f"clip clamped to ${MAX_ORDER_USD:.2f}"
+                 if config.order_size_usd > MAX_ORDER_USD else "")
+    print(f" Guardrails: size cap ${MAX_ORDER_USD:.2f}/clip · circuit breaker "
+          f"{CB_MAX_TRADES_PER_MIN} trades/{CB_WINDOW_SEC:.0f}s · "
+          f"{CB_MAX_CONSECUTIVE_LOSSES} consecutive losses → halt{size_note}")
     print("=" * 70)
     for w in config.warnings:
         print(YELLOW + f"[{_ts()}] ⚠️  config: {w}" + RESET)
@@ -2114,7 +2394,8 @@ async def run_live(config: "BotConfig",
     # straight from the config.
     portfolio = Portfolio(specs, config.order_size_usd, logger=trade_logger,
                           min_spread_bps=config.min_spread_bps,
-                          realism=config.realism)
+                          realism=config.realism,
+                          circuit_breaker_enabled=True)
     watchdog = StalenessWatchdog(portfolio, stale_threshold)
     portfolio.wire_ws_frame(watchdog.on_ws_frame)   # instant stale stand-down
     brokers = build_brokers(creds, portfolio, live,
