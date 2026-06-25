@@ -176,6 +176,17 @@ ORDER_WARN_USD = 11.00                      # above this → a LOUD clamp warnin
 CB_WINDOW_SEC = 60.0                        # rolling window for the rate limit
 CB_MAX_TRADES_PER_MIN = 30                  # max entries opened per window
 CB_MAX_CONSECUTIVE_LOSSES = 3               # consecutive losing round-trips → halt
+# Execution-health monitors (added alongside loss/rate):
+#  * MISSED-FILL STREAK — the gate keeps finding tradeable edges but the fills
+#    are rejected (quote pulled / friction erased the edge). A sustained run is
+#    an execution-degradation signature. Throttled so per-frame rejection storms
+#    accrue at a human timescale, and reset by any successful fill.
+#  * EDGE DEGRADATION — the rolling-average REALISED edge of the trades we do
+#    capture has compressed below a floor (friction is eating the edge).
+CB_MAX_MISSED_FILL_STREAK = 8               # consecutive missed fills → halt
+CB_MISSED_FILL_MIN_GAP_SEC = 1.0            # count a miss at most this often
+CB_EDGE_WINDOW = 5                          # rolling sample of realised edges
+CB_MIN_AVG_EDGE_BPS = 0.5                   # avg realised edge below this → halt
 
 # Notional staked per simulated arbitrage (USD).
 PAPER_STAKE_USD = 100.0
@@ -1199,11 +1210,16 @@ class CircuitBreakerTripped(RuntimeError):
 class CircuitBreaker:
     """Portfolio-wide trading circuit breaker (shared by every symbol gate).
 
-    Two independent rules, either of which trips ONE global halt:
+    Four independent rules, any of which trips ONE global halt:
 
       * RATE LIMIT        — more than ``max_trades_per_min`` entries opened
                             within a rolling ``window_sec`` window (runaway loop).
       * CONSECUTIVE LOSS  — ``max_consecutive_losses`` losing round-trips in a row.
+      * MISSED-FILL STREAK — ``max_missed_fill_streak`` consecutive missed fills
+                            (since the last successful fill); the gate keeps
+                            finding edges it can't actually capture.
+      * EDGE DEGRADATION  — the rolling average REALISED edge over the last
+                            ``edge_window`` trades falls below ``min_avg_edge_bps``.
 
     Disabled by default (``enabled=False``) so ad-hoc engines and unit tests are
     unaffected; ``run_live`` constructs it enabled. Every clock is monotonic, so
@@ -1213,15 +1229,26 @@ class CircuitBreaker:
     def __init__(self, portfolio, *, enabled: bool = False,
                  max_trades_per_min: int = CB_MAX_TRADES_PER_MIN,
                  max_consecutive_losses: int = CB_MAX_CONSECUTIVE_LOSSES,
-                 window_sec: float = CB_WINDOW_SEC) -> None:
+                 window_sec: float = CB_WINDOW_SEC,
+                 max_missed_fill_streak: int = CB_MAX_MISSED_FILL_STREAK,
+                 miss_min_gap_sec: float = CB_MISSED_FILL_MIN_GAP_SEC,
+                 edge_window: int = CB_EDGE_WINDOW,
+                 min_avg_edge_bps: float = CB_MIN_AVG_EDGE_BPS) -> None:
         self.portfolio = portfolio
         self.enabled = bool(enabled)
         self.max_trades_per_min = int(max_trades_per_min)
         self.max_consecutive_losses = int(max_consecutive_losses)
         self.window_sec = float(window_sec)
+        self.max_missed_fill_streak = int(max_missed_fill_streak)
+        self.miss_min_gap_sec = float(miss_min_gap_sec)
+        self.edge_window = int(edge_window)
+        self.min_avg_edge_bps = float(min_avg_edge_bps)
         self.tripped = False
         self._trade_times = deque()     # monotonic stamps of recent entries
         self._loss_streak = 0
+        self._miss_streak = 0           # consecutive missed fills since a fill
+        self._last_miss_at = 0.0        # monotonic stamp of last counted miss
+        self._edges = deque(maxlen=self.edge_window)   # recent realised edge bps
 
     # --- rate limit --------------------------------------------------------
     def _evict(self, now: float) -> None:
@@ -1248,10 +1275,14 @@ class CircuitBreaker:
                 symbol)
 
     def record_trade(self) -> None:
-        """Count a position that actually opened toward the rate window."""
+        """Count a position that actually opened toward the rate window.
+
+        A successful fill also breaks any in-progress missed-fill streak.
+        """
         if not self.enabled:
             return
         self._trade_times.append(time.monotonic())
+        self._miss_streak = 0
 
     # --- consecutive losses ------------------------------------------------
     def record_result(self, pnl: float, symbol: str) -> None:
@@ -1268,6 +1299,51 @@ class CircuitBreaker:
                 f"{self._loss_streak} consecutive losing round-trips hit the "
                 f"cap of {self.max_consecutive_losses}",
                 symbol)
+
+    # --- missed-fill streak ------------------------------------------------
+    def record_missed_fill(self, symbol: str) -> None:
+        """A tradeable edge was found but the fill was REJECTED (quote pulled or
+        friction erased it). Trips on a sustained run with no successful fill.
+
+        THROTTLED: missed fills closer together than ``miss_min_gap_sec`` count
+        once, so a per-frame rejection storm accrues at a human timescale rather
+        than tripping in a few milliseconds. Reset by any successful fill
+        (``record_trade``).
+        """
+        if not self.enabled or self.tripped:
+            return
+        now = time.monotonic()
+        if now - self._last_miss_at < self.miss_min_gap_sec:
+            return                       # already counted a miss very recently
+        self._last_miss_at = now
+        self._miss_streak += 1
+        if self._miss_streak >= self.max_missed_fill_streak:
+            raise self._trip(
+                "MISSED_FILL_STREAK",
+                f"{self._miss_streak} consecutive missed fills (≥"
+                f"{self.miss_min_gap_sec:.0f}s apart, no fill in between) hit "
+                f"the cap of {self.max_missed_fill_streak} — the book keeps "
+                f"slipping away",
+                symbol)
+
+    # --- edge degradation --------------------------------------------------
+    def record_edge(self, edge_bps: float, symbol: str) -> None:
+        """Feed the REALISED edge (bps) of a freshly-opened trade. Trips when the
+        rolling average over the last ``edge_window`` trades degrades below
+        ``min_avg_edge_bps`` — the edges we capture have compressed to marginal.
+        """
+        if not self.enabled or self.tripped:
+            return
+        self._edges.append(float(edge_bps))
+        if len(self._edges) >= self.edge_window:
+            avg = sum(self._edges) / len(self._edges)
+            if avg < self.min_avg_edge_bps:
+                raise self._trip(
+                    "EDGE_DEGRADATION",
+                    f"avg realised edge {avg:.2f} bps over the last "
+                    f"{len(self._edges)} trades fell below the "
+                    f"{self.min_avg_edge_bps:.2f} bps floor",
+                    symbol)
 
     # --- trip + halt -------------------------------------------------------
     def _trip(self, rule: str, detail: str,
@@ -1300,6 +1376,12 @@ class CircuitBreaker:
             "trades_in_window": len(self._trade_times),
             "max_trades_per_min": self.max_trades_per_min,
             "window_sec": self.window_sec,
+            "miss_streak": self._miss_streak,
+            "max_missed_fill_streak": self.max_missed_fill_streak,
+            "recent_edges_bps": [round(e, 2) for e in self._edges],
+            "avg_edge_bps": (round(sum(self._edges) / len(self._edges), 2)
+                             if self._edges else None),
+            "min_avg_edge_bps": self.min_avg_edge_bps,
             "session_realized_pnl": round(
                 getattr(self.portfolio, "realized_pnl", 0.0), 6),
             "session_trade_count": getattr(self.portfolio, "trade_count", 0),
@@ -1442,6 +1524,10 @@ class _ArbGate:
                               f"[{_ts()}] 🛑 MISSED FILL [{sym}] {best.direction} "
                               f"{best.bps:+.2f} bps — quote pulled or slippage/"
                               f"latency erased the edge." + RESET)
+                    # Feed the rejected attempt to the breaker (throttled); a
+                    # sustained streak with no fill trips it (raises) here.
+                    if self.breaker is not None:
+                        self.breaker.record_missed_fill(sym)
                     return
             led.open_position(best, stake, fill=fill)
             if led.open_trade is not None:
@@ -1470,6 +1556,13 @@ class _ArbGate:
                   f"SELL {best.sell_venue} @ {_fmt_px(sell_px)}"
                   f"{extra}"
                   + RESET)
+            # Feed the realised entry edge to the degradation monitor (raises
+            # → caught in on_update if the rolling average has degraded).
+            if self.breaker is not None and led.open_trade is not None:
+                pos = led.open_trade
+                edge_bps = (pos.locked_per_unit / pos.entry_buy * 1e4
+                            if pos.entry_buy else 0.0)
+                self.breaker.record_edge(edge_bps, sym)
         else:
             now = time.monotonic()
             if now - self._last_block_log >= self._block_interval:
@@ -1545,6 +1638,12 @@ class _ArbGate:
               f"{d['loss_streak']}/{d['max_consecutive_losses']} · window="
               f"{d['trades_in_window']}/{d['max_trades_per_min']} per "
               f"{d['window_sec']:.0f}s" + RESET)
+        avg = d['avg_edge_bps']
+        print(RED + f"⛔   miss_streak={d['miss_streak']}/"
+              f"{d['max_missed_fill_streak']} · avg_edge="
+              f"{('%.2f' % avg) if avg is not None else 'n/a'}/"
+              f"{d['min_avg_edge_bps']:.2f} bps · recent_edges="
+              f"{d['recent_edges_bps']}" + RESET)
         print(RED + f"⛔   session: {d['session_trade_count']} trade(s), "
               f"realized ${d['session_realized_pnl']:+.4f}" + RESET)
         for name, snap in d["per_symbol"].items():
@@ -2347,7 +2446,9 @@ async def run_live(config: "BotConfig",
                  if config.order_size_usd > MAX_ORDER_USD else "")
     print(f" Guardrails: size cap ${MAX_ORDER_USD:.2f}/clip · circuit breaker "
           f"{CB_MAX_TRADES_PER_MIN} trades/{CB_WINDOW_SEC:.0f}s · "
-          f"{CB_MAX_CONSECUTIVE_LOSSES} consecutive losses → halt{size_note}")
+          f"{CB_MAX_CONSECUTIVE_LOSSES} losses · {CB_MAX_MISSED_FILL_STREAK} "
+          f"missed-fill streak · edge floor {CB_MIN_AVG_EDGE_BPS:.1f}bps/"
+          f"{CB_EDGE_WINDOW} → halt{size_note}")
     print("=" * 70)
     for w in config.warnings:
         print(YELLOW + f"[{_ts()}] ⚠️  config: {w}" + RESET)

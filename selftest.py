@@ -1043,16 +1043,102 @@ async def test_guardrails():
     check("loss trip carries the CONSECUTIVE_LOSSES rule",
           loss_rule, "CONSECUTIVE_LOSSES")
 
+    # --- MISSED-FILL STREAK: a successful fill resets it; a run trips. ---
+    #     miss_min_gap_sec=0 so every test call counts (no throttle).
+    cb3 = lc.CircuitBreaker(pf, enabled=True, max_missed_fill_streak=3,
+                            miss_min_gap_sec=0.0)
+    cb3.record_missed_fill("SOL")           # streak 1
+    cb3.record_missed_fill("SOL")           # streak 2
+    cb3.record_trade()                      # a FILL → resets the streak to 0
+    miss_early = False
+    try:
+        cb3.record_missed_fill("SOL")       # streak 1 (would be 3 w/o the reset)
+    except lc.CircuitBreakerTripped:
+        miss_early = True
+    check("a successful fill reset the missed-fill streak", miss_early, False)
+    miss_trip, miss_rule = False, None
+    try:
+        cb3.record_missed_fill("SOL")       # streak 2
+        cb3.record_missed_fill("SOL")       # streak 3 → trip
+    except lc.CircuitBreakerTripped as exc:
+        miss_trip, miss_rule = True, exc.rule
+    check("3 consecutive missed fills trips the breaker", miss_trip, True)
+    check("missed-fill trip carries the MISSED_FILL_STREAK rule",
+          miss_rule, "MISSED_FILL_STREAK")
+
+    # --- MISSED-FILL THROTTLE: rapid misses inside the gap count once. ---
+    cb3b = lc.CircuitBreaker(pf, enabled=True, max_missed_fill_streak=3,
+                             miss_min_gap_sec=30.0)
+    throttled_ok = True
+    try:
+        for _ in range(10):                 # 10 rapid misses, all within 30s
+            cb3b.record_missed_fill("SOL")
+    except lc.CircuitBreakerTripped:
+        throttled_ok = False
+    check("throttle: a per-frame miss storm does NOT trip instantly",
+          throttled_ok, True)
+
+    # --- EDGE DEGRADATION: rolling-avg realised edge below the floor trips. ---
+    cb4 = lc.CircuitBreaker(pf, enabled=True, edge_window=3,
+                            min_avg_edge_bps=2.0)
+    cb4.record_edge(10.0, "SOL")            # healthy
+    cb4.record_edge(10.0, "SOL")            # healthy (avg 10 ≥ 2, no trip yet)
+    deg_full = False
+    try:
+        cb4.record_edge(10.0, "SOL")        # window full, avg 10 ≥ 2 → OK
+    except lc.CircuitBreakerTripped:
+        deg_full = True
+    check("healthy edges keep the breaker closed", deg_full, False)
+    deg_trip, deg_rule = False, None
+    cb5 = lc.CircuitBreaker(pf, enabled=True, edge_window=3,
+                            min_avg_edge_bps=2.0)
+    try:
+        cb5.record_edge(1.0, "SOL")         # below floor, window not yet full
+        cb5.record_edge(1.0, "SOL")
+        cb5.record_edge(1.0, "SOL")         # full, avg 1.0 < 2.0 → trip
+    except lc.CircuitBreakerTripped as exc:
+        deg_trip, deg_rule = True, exc.rule
+    check("a degraded rolling-average edge trips the breaker", deg_trip, True)
+    check("edge trip carries the EDGE_DEGRADATION rule",
+          deg_rule, "EDGE_DEGRADATION")
+    # One fat edge in the window lifts the average back above the floor.
+    cb6 = lc.CircuitBreaker(pf, enabled=True, edge_window=3,
+                            min_avg_edge_bps=2.0)
+    mixed_ok = True
+    try:
+        cb6.record_edge(1.0, "SOL")
+        cb6.record_edge(1.0, "SOL")
+        cb6.record_edge(10.0, "SOL")        # avg = 4.0 ≥ 2.0 → no trip
+    except lc.CircuitBreakerTripped:
+        mixed_ok = False
+    check("a strong edge in the window averts the trip", mixed_ok, True)
+
+    # --- Diagnostic snapshot carries the new monitor state. ---
+    diag2 = None
+    cb7 = lc.CircuitBreaker(pf, enabled=True, max_missed_fill_streak=1,
+                            miss_min_gap_sec=0.0)
+    try:
+        cb7.record_missed_fill("SOL")
+    except lc.CircuitBreakerTripped as exc:
+        diag2 = exc.diagnostic
+    check("diagnostic reports the missed-fill streak",
+          diag2 is not None and "miss_streak" in diag2, True)
+    check("diagnostic reports the recent realised edges",
+          diag2 is not None and "recent_edges_bps" in diag2, True)
+
     # --- Disabled breaker NEVER trips (default for tests/ad-hoc engines). ---
-    cb_off = lc.CircuitBreaker(pf, enabled=False, max_consecutive_losses=1)
+    cb_off = lc.CircuitBreaker(pf, enabled=False, max_consecutive_losses=1,
+                               max_missed_fill_streak=1, miss_min_gap_sec=0.0,
+                               edge_window=1, min_avg_edge_bps=999.0)
     quiet = True
     try:
         cb_off.record_result(-1.0, "SOL")
-        cb_off.record_result(-1.0, "SOL")
+        cb_off.record_missed_fill("SOL")
+        cb_off.record_edge(0.0, "SOL")
         cb_off.check_rate("SOL")
     except lc.CircuitBreakerTripped:
         quiet = False
-    check("disabled breaker never trips", quiet, True)
+    check("disabled breaker never trips (all four rules)", quiet, True)
     check("Portfolio breaker is disabled by default",
           lc.Portfolio([spec("SOL")], lc.PAPER_STAKE_USD).breaker.enabled, False)
 
