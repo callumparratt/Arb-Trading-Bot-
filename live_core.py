@@ -197,6 +197,10 @@ ALERT_WEBHOOK_ENV = "DISCORD_WEBHOOK_URL"   # env var holding the secret URL
 ALERT_SUMMARY_INTERVAL_SEC = 3600.0         # hourly trade/PnL summary cadence
 ALERT_HTTP_TIMEOUT_SEC = 5.0                # per-POST timeout (never block long)
 ALERT_USERNAME = "kalshi-poly arb"          # Discord webhook display name
+# A venue must stay continuously stale this long before a DOWN alert fires, so
+# transient drops that auto-reconnect within the window are never alerted
+# (debounce). This is ON TOP of the staleness threshold itself.
+ALERT_WS_DEBOUNCE_SEC = 30.0
 # Discord embed side-bar colours, keyed by severity level.
 _ALERT_COLOR = {
     "critical": 0xE74C3C,   # red
@@ -2197,14 +2201,29 @@ class StalenessWatchdog:
     the instant any symbol's frame arrives on that venue. Each venue is a single
     shared socket feeding every symbol, so liveness is tracked per-venue (across
     all books), not per-symbol. The stream tasks own reconnection; this only
-    annotates liveness for the dashboard."""
+    annotates liveness for the dashboard.
+
+    DEBOUNCED OUTAGE ALERTS
+    -----------------------
+    On top of the dashboard annotation, a venue that stays continuously stale for
+    ``alert_debounce`` seconds fires a SINGLE Discord DOWN alert (latched so it
+    never repeats), and a RECOVERED alert when it returns. A drop that
+    auto-reconnects before the debounce elapses is treated as a transient blip
+    and is NEVER alerted — that is the debounce.
+    """
 
     VENUES = ("binance", "bybit", "okx")
 
-    def __init__(self, portfolio: "Portfolio", threshold: float) -> None:
+    def __init__(self, portfolio: "Portfolio", threshold: float,
+                 notifier: "AlertNotifier | None" = None,
+                 alert_debounce: float = ALERT_WS_DEBOUNCE_SEC) -> None:
         self.portfolio = portfolio
         self.threshold = float(threshold)
+        self.notifier = notifier
+        self.alert_debounce = float(alert_debounce)
         self._stale = {v: False for v in self.VENUES}
+        self._stale_since = {v: None for v in self.VENUES}   # monotonic stamp
+        self._alerted = {v: False for v in self.VENUES}      # DOWN-alert latch
 
     def _venue_books(self, venue: str):
         return [e.state._book(venue) for e in self.portfolio.engines.values()]
@@ -2213,15 +2232,52 @@ class StalenessWatchdog:
         self._stale[venue] = stale
         for b in self._venue_books(venue):
             b.stale = stale
+        if stale:
+            if self._stale_since[venue] is None:
+                self._stale_since[venue] = time.monotonic()
+        else:
+            self._stale_since[venue] = None
 
     def is_stale(self, venue: str) -> bool:
         return self._stale.get(venue, False)
 
     def on_ws_frame(self, feed: str) -> None:
         if self._stale.get(feed):
+            was_alerted = self._alerted.get(feed, False)
             self._set_stale(feed, False)
             print(f"[{_ts()}] ⚡ {feed.capitalize()} WebSocket restored "
                   f"(all symbols).")
+            # Only alert recovery if we actually alerted the outage — a blip that
+            # never crossed the debounce stays silent on both edges.
+            if was_alerted and self.notifier is not None:
+                self.notifier.notify(
+                    f"✅ WebSocket RECOVERED — {feed.capitalize()}",
+                    description=(f"The {feed.capitalize()} feed is live again; "
+                                 f"pricing resumed on this venue."),
+                    level="success",
+                    fields=[("Venue", feed.capitalize(), True)])
+            self._alerted[feed] = False
+
+    def _maybe_alert_outage(self, now: float) -> None:
+        """Debounced one-shot DOWN alert per venue stale longer than the window."""
+        if self.notifier is None:
+            return
+        for venue in self.VENUES:
+            since = self._stale_since[venue]
+            if (since is not None and not self._alerted[venue]
+                    and now - since >= self.alert_debounce):
+                self._alerted[venue] = True
+                down_for = now - since
+                self.notifier.notify(
+                    f"🔌 WebSocket DOWN — {venue.capitalize()}",
+                    description=(f"The {venue.capitalize()} feed has been stale "
+                                f"for {down_for:0.0f}s (debounced "
+                                f"≥{self.alert_debounce:0.0f}s). Streams "
+                                f"auto-reconnect; pricing excludes this venue "
+                                f"until it recovers."),
+                    level="warning",
+                    fields=[("Venue", venue.capitalize(), True),
+                            ("Stale for", f"{down_for:0.0f}s", True)])
 
     async def watchdog_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -2239,6 +2295,9 @@ class StalenessWatchdog:
                     self._set_stale(venue, True)
                     print(YELLOW + f"[{_ts()}] ⚠️  {venue.capitalize()} WebSocket "
                           f"silent for {silent_for:0.0f}s (all symbols)." + RESET)
+            # Debounced outage alerts: fire once a venue's staleness outlasts the
+            # debounce window (transient drops that recover first stay silent).
+            self._maybe_alert_outage(now)
 
 
 # ---------------------------------------------------------------------------
@@ -2754,7 +2813,7 @@ async def run_live(config: "BotConfig",
                           realism=config.realism,
                           circuit_breaker_enabled=True,
                           notifier=notifier)
-    watchdog = StalenessWatchdog(portfolio, stale_threshold)
+    watchdog = StalenessWatchdog(portfolio, stale_threshold, notifier=notifier)
     portfolio.wire_ws_frame(watchdog.on_ws_frame)   # instant stale stand-down
     brokers = build_brokers(creds, portfolio, live,
                             initial_equity=config.order_size_usd)

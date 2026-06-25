@@ -1292,6 +1292,73 @@ async def test_alerting():
 
 
 # ---------------------------------------------------------------------------
+# 16) Debounced WebSocket watchdog alert
+# ---------------------------------------------------------------------------
+
+async def test_ws_watchdog_alert():
+    section("16) DEBOUNCED WEBSOCKET WATCHDOG ALERT")
+
+    # --- Sustained outage: no alert before the debounce, one after, latched. ---
+    n, rec = _rec_notifier()
+    wd = lc.StalenessWatchdog(fresh_portfolio("SOL"), threshold=15.0,
+                              notifier=n, alert_debounce=30.0)
+    base = lc.time.monotonic()
+    wd._set_stale("binance", True)
+    wd._stale_since["binance"] = base          # pin for deterministic timing
+
+    wd._maybe_alert_outage(base + 10.0)        # within debounce window
+    n.flush()
+    check("no DOWN alert before the debounce window elapses", len(rec), 0)
+
+    wd._maybe_alert_outage(base + 31.0)        # past the debounce window
+    n.flush()
+    down = [p for p in rec if "DOWN" in p["embeds"][0]["title"]]
+    check("a sustained outage fires exactly one DOWN alert", len(down), 1)
+    check("the DOWN alert is a warning (orange)",
+          down[0]["embeds"][0]["color"], lc._ALERT_COLOR["warning"])
+    check("the DOWN alert names the venue",
+          "Binance" in down[0]["embeds"][0]["title"], True)
+
+    wd._maybe_alert_outage(base + 90.0)        # still down → must NOT repeat
+    n.flush()
+    check("the DOWN alert does not repeat while still down (latched)",
+          len([p for p in rec if "DOWN" in p["embeds"][0]["title"]]), 1)
+
+    # --- Recovery after a DOWN alert fires exactly one RECOVERED alert. ---
+    wd.on_ws_frame("binance")
+    n.flush()
+    up = [p for p in rec if "RECOVERED" in p["embeds"][0]["title"]]
+    check("recovery after a DOWN alert fires one RECOVERED alert", len(up), 1)
+    check("the RECOVERED alert is success (green)",
+          up[0]["embeds"][0]["color"], lc._ALERT_COLOR["success"])
+    check("recovery clears the DOWN-alert latch",
+          wd._alerted["binance"], False)
+    n.close()
+
+    # --- DEBOUNCE: a blip that recovers before the window → NO alert at all. ---
+    n2, rec2 = _rec_notifier()
+    wd2 = lc.StalenessWatchdog(fresh_portfolio("SOL"), threshold=15.0,
+                               notifier=n2, alert_debounce=30.0)
+    b2 = lc.time.monotonic()
+    wd2._set_stale("bybit", True)
+    wd2._stale_since["bybit"] = b2
+    wd2._maybe_alert_outage(b2 + 5.0)          # still inside the debounce window
+    wd2.on_ws_frame("bybit")                    # recovers early
+    n2.flush()
+    check("a transient blip (recovered < debounce) sends NO alert", len(rec2), 0)
+    n2.close()
+
+    # --- A watchdog with no notifier never alerts and never crashes. ---
+    wd3 = lc.StalenessWatchdog(fresh_portfolio("SOL"), threshold=15.0,
+                               notifier=None)
+    wd3._set_stale("okx", True)
+    wd3._stale_since["okx"] = lc.time.monotonic() - 100.0
+    wd3._maybe_alert_outage(lc.time.monotonic())   # no notifier → no-op
+    wd3.on_ws_frame("okx")
+    check("watchdog with no notifier is a clean no-op", wd3.is_stale("okx"), False)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1313,7 +1380,8 @@ async def _run_all():
               test_execution_realism,
               test_config_editor,
               test_guardrails,
-              test_alerting):
+              test_alerting,
+              test_ws_watchdog_alert):
         await t()
     print(f"\n{BOLD}{'=' * 64}{RESET}")
     total = _PASS + _FAIL
