@@ -2,3 +2,4 @@ httpx
 pydantic
 websockets
 backoff
+python-dotenv
