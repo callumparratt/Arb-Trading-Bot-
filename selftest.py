@@ -1359,6 +1359,178 @@ async def test_ws_watchdog_alert():
 
 
 # ---------------------------------------------------------------------------
+# 17) Expanded symbol universe (per-venue price scaling) + extended config
+# ---------------------------------------------------------------------------
+
+async def test_symbol_scaling_and_config_sections():
+    section("17) SYMBOL SCALING + EXTENDED CONFIG SECTIONS")
+    import os as _os
+    import tempfile
+
+    # --- The catalog now carries all ten tracked symbols. ---
+    for name in ("SOL", "DOGE", "AVAX", "WIF", "APT",
+                 "XRP", "LINK", "NEAR", "PEPE", "BONK"):
+        check(f"catalog contains {name}", name in lc.SYMBOL_CATALOG, True)
+
+    # --- 1:1 symbols default to no scaling; PEPE/BONK scale Binance & Bybit. ---
+    xrp = lc.SYMBOL_CATALOG["XRP"]
+    check("XRP needs no scaling (all venues 1.0)",
+          (xrp.binance_scale, xrp.bybit_scale, xrp.okx_scale), (1.0, 1.0, 1.0))
+    pepe = lc.SYMBOL_CATALOG["PEPE"]
+    check("PEPE Binance leg is the 1000x-bundled contract",
+          pepe.binance, "1000pepeusdt")
+    check("PEPE Binance/Bybit price scale is 1000",
+          (pepe.binance_scale, pepe.bybit_scale), (1000.0, 1000.0))
+    check("PEPE OKX leg is the UNSCALED swap", pepe.okx, "PEPE-USDT-SWAP")
+    check("PEPE OKX scale is 1.0 (already per-token)", pepe.okx_scale, 1.0)
+    check("scale_for routes by feed name",
+          (pepe.scale_for("binance"), pepe.scale_for("okx")), (1000.0, 1.0))
+    bonk = lc.SYMBOL_CATALOG["BONK"]
+    check("BONK also 1000x on Binance/Bybit, unscaled on OKX",
+          (bonk.binance_scale, bonk.bybit_scale, bonk.okx_scale), (1000.0, 1000.0, 1.0))
+
+    # --- Parsers divide the FRESH side by the scale (default 1.0 = no-op). ---
+    bn = lc.parse_binance_book(json.dumps({"b": "0.01200000", "a": "0.01201000"}),
+                               pepe.binance_scale)
+    check("scaled Binance bid is per-token (0.012/1000)", bn[0], 0.0000120, tol=1e-12)
+    check("scaled Binance ask is per-token", bn[1], 0.00001201, tol=1e-12)
+    bn1 = lc.parse_binance_book(json.dumps({"b": "100.00", "a": "100.05"}))
+    check("default scale 1.0 leaves prices untouched", bn1, (100.00, 100.05))
+
+    # --- THE KEY CORRECTNESS PROOF: a bundled venue (Binance) vs an unscaled
+    #     venue (OKX) would manufacture a ~1000x phantom edge WITHOUT scaling;
+    #     WITH scaling the two books line up and no phantom arb appears. ---
+    st = lc.PerpBookState(pepe)
+    bn = lc.parse_binance_book(json.dumps({"b": "0.01200000", "a": "0.01201000"}),
+                               pepe.binance_scale)
+    st.update("binance", bn[0], bn[1])
+    okx_raw = json.dumps({"arg": {"channel": "bbo-tbt", "instId": "PEPE-USDT-SWAP"},
+                          "data": [{"bids": [["0.00001200", "1"]],
+                                    "asks": [["0.00001201", "1"]]}]})
+    ok = lc.parse_okx_book(okx_raw, scale=pepe.okx_scale)
+    st.update("okx", ok[0], ok[1])
+    check("after scaling, Binance & OKX PEPE books share the SAME unit",
+          abs(st.binance.bid - st.okx.bid) < 1e-6, True)
+    worst_bps = max((abs(e.bps) for e in lc.evaluate_edges(st)), default=0.0)
+    check("no 1000x phantom edge after normalisation (|bps| small)",
+          worst_bps < 1000.0, True)
+
+    # Contrast: feed the RAW bundled price straight in (scaling bypassed) and a
+    # gigantic phantom edge appears — exactly the bug the *_scale fields prevent.
+    bad = lc.PerpBookState(pepe)
+    bad.update("binance", 0.01200, 0.012010)   # bundled price, NOT normalised
+    bad.update("okx", 0.0000120, 0.0000121)    # per-token
+    check("UNnormalised books DO manufacture a huge phantom edge (the avoided bug)",
+          max((e.bps for e in lc.evaluate_edges(bad)), default=0.0) > 1e4, True)
+
+    # --- Config: the new sections parse and land on the right dataclasses. ---
+    tmp = tempfile.gettempdir()
+    p = _os.path.join(tmp, "selftest_cfg_sections.json")
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({
+            "trade_cooldown_sec": 4.0,
+            "taker_fee_per_fill": 0.0007,
+            "risk": {"max_order_usd": 25.0, "unhedged_grace_sec": 8.0},
+            "circuit_breaker": {"max_trades_per_min": 50, "min_avg_edge_bps": 1.5},
+            "alerts": {"summary_interval_sec": 1800.0, "username": "my-bot"},
+            "liveness": {"stale_threshold_sec": 20.0, "recv_timeout_sec": 25.0},
+        }, fh)
+    cfg = lc.load_config(p)
+    check("top-level trade_cooldown_sec parsed", cfg.trade_cooldown_sec, 4.0)
+    check("top-level taker_fee_per_fill parsed", cfg.taker_fee_per_fill, 0.0007)
+    check("risk.max_order_usd parsed", cfg.risk.max_order_usd, 25.0)
+    check("risk.unhedged_grace_sec parsed", cfg.risk.unhedged_grace_sec, 8.0)
+    check("absent risk field keeps its default (discrepancy_tol)",
+          cfg.risk.discrepancy_tol_usd, lc.DISCREPANCY_TOL_USD)
+    check("circuit_breaker.max_trades_per_min parsed",
+          cfg.circuit_breaker.max_trades_per_min, 50)
+    check("circuit_breaker.min_avg_edge_bps parsed",
+          cfg.circuit_breaker.min_avg_edge_bps, 1.5)
+    check("circuit_breaker.enabled defaults True", cfg.circuit_breaker.enabled, True)
+    check("alerts.summary_interval_sec parsed",
+          cfg.alerts.summary_interval_sec, 1800.0)
+    check("alerts.username parsed", cfg.alerts.username, "my-bot")
+    check("liveness.stale_threshold_sec parsed",
+          cfg.liveness.stale_threshold_sec, 20.0)
+    check("liveness.recv_timeout_sec parsed", cfg.liveness.recv_timeout_sec, 25.0)
+    _os.remove(p)
+
+    # --- Absent sections → every default mirrors today's constants. ---
+    d = lc.BotConfig()
+    check("default risk.max_order_usd == MAX_ORDER_USD",
+          d.risk.max_order_usd, lc.MAX_ORDER_USD)
+    check("default circuit_breaker.window_sec == CB_WINDOW_SEC",
+          d.circuit_breaker.window_sec, lc.CB_WINDOW_SEC)
+    check("default alerts.username == ALERT_USERNAME",
+          d.alerts.username, lc.ALERT_USERNAME)
+    check("default liveness.watchdog_tick_sec == WATCHDOG_TICK_SEC",
+          d.liveness.watchdog_tick_sec, lc.WATCHDOG_TICK_SEC)
+
+    # --- Validation: bad sub-block values fail fast (no silent default). ---
+    for bad_obj, label in (
+        ({"circuit_breaker": {"max_trades_per_min": -1}}, "negative CB int"),
+        ({"circuit_breaker": {"max_trades_per_min": True}}, "bool where int"),
+        ({"risk": {"max_order_usd": 0}}, "zero size cap"),
+        ({"risk": "nope"}, "non-object risk block"),
+        ({"alerts": {"username": 5}}, "non-string username"),
+        ({"liveness": {"recv_timeout_sec": -2}}, "negative timeout"),
+    ):
+        bp = _os.path.join(tmp, "selftest_cfg_badsection.json")
+        with open(bp, "w", encoding="utf-8") as fh:
+            json.dump(bad_obj, fh)
+        raised = False
+        try:
+            lc.load_config(bp)
+        except SystemExit:
+            raised = True
+        check(f"invalid config rejected: {label}", raised, True)
+        _os.remove(bp)
+
+    # --- Editor: dotted section keys route correctly; unknowns rejected. ---
+    raw = {}
+    lc._apply_set(raw, "circuit_breaker.max_trades_per_min", 50)
+    lc._apply_set(raw, "risk.max_order_usd", 25.0)
+    lc._apply_set(raw, "alerts.username", "x")
+    check("_apply_set writes circuit_breaker.*",
+          raw["circuit_breaker"]["max_trades_per_min"], 50)
+    check("_apply_set writes risk.*", raw["risk"]["max_order_usd"], 25.0)
+    bad_routed = False
+    try:
+        lc._apply_set(raw, "circuit_breaker.bogus", 1)
+    except SystemExit:
+        bad_routed = True
+    check("_apply_set rejects an unknown section field", bad_routed, True)
+    bad_section = False
+    try:
+        lc._apply_set(raw, "nosuch.field", 1)
+    except SystemExit:
+        bad_section = True
+    check("_apply_set rejects an unknown section", bad_section, True)
+
+    # --- _apply_runtime_overrides pushes config onto the module globals; we
+    #     SAVE + RESTORE them so nothing leaks into other tests or real runs. ---
+    saved = (lc.TAKER_FEE_PER_FILL, lc.TAKER_FEE, lc.TRADE_COOLDOWN_SEC,
+             lc.MAX_ORDER_USD, lc.ORDER_WARN_USD, lc.PRINT_INTERVAL_SEC,
+             lc.WATCHDOG_TICK_SEC, lc.RECV_TIMEOUT_SEC)
+    try:
+        oc = lc.BotConfig(taker_fee_per_fill=0.0005, trade_cooldown_sec=3.0,
+                          risk=lc.RiskParams(max_order_usd=42.0),
+                          liveness=lc.LivenessParams(recv_timeout_sec=33.0))
+        lc._apply_runtime_overrides(oc)
+        check("override sets the taker-fee global", lc.TAKER_FEE_PER_FILL, 0.0005)
+        check("override recomputes round-trip TAKER_FEE", lc.TAKER_FEE, 0.0010,
+              tol=1e-12)
+        check("override sets the cooldown global", lc.TRADE_COOLDOWN_SEC, 3.0)
+        check("override sets the size-cap global", lc.MAX_ORDER_USD, 42.0)
+        check("override sets the recv-timeout global", lc.RECV_TIMEOUT_SEC, 33.0)
+    finally:
+        (lc.TAKER_FEE_PER_FILL, lc.TAKER_FEE, lc.TRADE_COOLDOWN_SEC,
+         lc.MAX_ORDER_USD, lc.ORDER_WARN_USD, lc.PRINT_INTERVAL_SEC,
+         lc.WATCHDOG_TICK_SEC, lc.RECV_TIMEOUT_SEC) = saved
+    check("globals restored after the override test", lc.MAX_ORDER_USD, saved[3])
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1381,7 +1553,8 @@ async def _run_all():
               test_config_editor,
               test_guardrails,
               test_alerting,
-              test_ws_watchdog_alert):
+              test_ws_watchdog_alert,
+              test_symbol_scaling_and_config_sections):
         await t()
     print(f"\n{BOLD}{'=' * 64}{RESET}")
     total = _PASS + _FAIL

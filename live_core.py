@@ -102,17 +102,48 @@ class SymbolSpec:
     binance: str     # Binance USDⓈ-M stream symbol, e.g. "solusdt"
     bybit: str       # Bybit V5 linear symbol, e.g. "SOLUSDT"
     okx: str         # OKX swap instId, e.g. "SOL-USDT-SWAP"
+    # Per-venue PRICE SCALE: how many underlying tokens are bundled into one unit
+    # of THAT venue's quoted price. Almost every contract is 1:1 (scale 1.0), but
+    # sub-$0.0001 memecoins list as 1000×-BUNDLED contracts on Binance/Bybit
+    # (e.g. "1000PEPEUSDT" quotes the price of 1000 PEPE) while OKX lists them
+    # UNSCALED ("PEPE-USDT-SWAP" quotes one PEPE). Dividing each venue's streamed
+    # price by its scale renormalises every book to the SAME per-token unit, so
+    # the cross-venue edge math compares like with like — without it the raw
+    # 1000× gap would masquerade as a permanent phantom arbitrage.
+    binance_scale: float = 1.0
+    bybit_scale: float = 1.0
+    okx_scale: float = 1.0
+
+    def scale_for(self, feed: str) -> float:
+        """Price divisor for a venue feed ('binance' / 'bybit' / 'okx')."""
+        return {"binance": self.binance_scale,
+                "bybit": self.bybit_scale,
+                "okx": self.okx_scale}.get(feed, 1.0)
 
 
 TARGET_SYMBOLS = [
     SymbolSpec("SOL",  "solusdt",  "SOLUSDT",  "SOL-USDT-SWAP"),
     SymbolSpec("DOGE", "dogeusdt", "DOGEUSDT", "DOGE-USDT-SWAP"),
-    # AVAX replaces PEPE: PEPE only lists as the 1000x-scaled "1000PEPEUSDT" on
-    # Binance/Bybit, which would not price-match OKX's unscaled PEPE-USDT-SWAP.
-    # AVAX is high-vol and lists 1:1 with identical naming on all three venues.
     SymbolSpec("AVAX", "avaxusdt", "AVAXUSDT", "AVAX-USDT-SWAP"),
     SymbolSpec("WIF",  "wifusdt",  "WIFUSDT",  "WIF-USDT-SWAP"),
     SymbolSpec("APT",  "aptusdt",  "APTUSDT",  "APT-USDT-SWAP"),
+    # --- High-volatility / high-volume additions -----------------------------
+    # XRP / LINK / NEAR list 1:1 with identical pricing on all three venues, so
+    # they need no scaling — straightforward additions.
+    SymbolSpec("XRP",  "xrpusdt",  "XRPUSDT",  "XRP-USDT-SWAP"),
+    SymbolSpec("LINK", "linkusdt", "LINKUSDT", "LINK-USDT-SWAP"),
+    SymbolSpec("NEAR", "nearusdt", "NEARUSDT", "NEAR-USDT-SWAP"),
+    # PEPE / BONK are sub-$0.0001 memecoins. Binance & Bybit list them as the
+    # 1000×-BUNDLED "1000PEPEUSDT" / "1000BONKUSDT" (price quoted per 1000
+    # tokens), whereas OKX lists the UNSCALED "PEPE-USDT-SWAP" / "BONK-USDT-SWAP"
+    # (price per single token). The *_scale=1000 on the Binance/Bybit legs
+    # divides their streamed price back to the per-token unit so all three books
+    # line up — this is exactly what makes them safe to track (vs. the phantom
+    # 1000× spread that would otherwise appear on every frame).
+    SymbolSpec("PEPE", "1000pepeusdt", "1000PEPEUSDT", "PEPE-USDT-SWAP",
+               binance_scale=1000.0, bybit_scale=1000.0),
+    SymbolSpec("BONK", "1000bonkusdt", "1000BONKUSDT", "BONK-USDT-SWAP",
+               binance_scale=1000.0, bybit_scale=1000.0),
 ]
 
 # Master catalog keyed by canonical name. config.json's ``target_markets`` is
@@ -233,6 +264,21 @@ DEFAULT_STALE_THRESHOLD = 15.0    # seconds of silence before a venue is "stale"
 # Reconnect backoff: deterministic exponential 2s, 4s, 8s, 16s ... capped.
 _BACKOFF_BASE = 2.0
 _BACKOFF_CAP = 60.0
+
+# --- Reconciliation / panic-close thresholds -------------------------------
+# Risk constants for the balance-reconciliation + unhedged-leg safety loop (see
+# ReconciliationGuard further below). Defined HERE, alongside the other operator
+# thresholds, so the config dataclasses (RiskParams) can default to them.
+# Virtual starting equity used as the reconciliation baseline (USD).
+INITIAL_EQUITY_USD = PAPER_STAKE_USD
+# Equity drift beyond this (live vs. internal ledger) triggers a panic.
+DISCREPANCY_TOL_USD = 5.0
+# An unhedged single leg exposed longer than this (seconds) triggers a panic.
+UNHEDGED_GRACE_SEC = 5.0
+# Full equity reconciliation cadence (seconds).
+RECONCILE_INTERVAL_SEC = 60.0
+# Fast tick for the unhedged-leg check (must be << UNHEDGED_GRACE_SEC).
+RECON_TICK_SEC = 1.0
 
 # ANSI colors for the gate / logger.
 RESET = "\033[0m"
@@ -446,11 +492,14 @@ class AlertNotifier:
         self._thread.join(timeout=5.0)
 
 
-def load_alert_notifier(sender=None) -> "AlertNotifier":
+def load_alert_notifier(sender=None, *, username: str = ALERT_USERNAME,
+                        timeout: float = ALERT_HTTP_TIMEOUT_SEC) -> "AlertNotifier":
     """Build an AlertNotifier from the environment. Alerts are ACTIVE iff
     ``DISCORD_WEBHOOK_URL`` is set; otherwise a disabled no-op notifier is
-    returned. The URL is a secret — read from env/.env, never logged."""
-    return AlertNotifier(os.environ.get(ALERT_WEBHOOK_ENV), sender=sender)
+    returned. The URL is a secret — read from env/.env, never logged.
+    ``username`` / ``timeout`` come from the config (``alerts`` block)."""
+    return AlertNotifier(os.environ.get(ALERT_WEBHOOK_ENV), sender=sender,
+                         username=username, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +547,60 @@ class RealismParams:
 
 
 @dataclass(frozen=True)
+class RiskParams:
+    """Risk + reconciliation knobs (config.json ``risk`` block).
+
+    Every field defaults to the module constant it overrides, so an absent block
+    (or absent field) reproduces today's behaviour exactly.
+    """
+    max_order_usd: float = MAX_ORDER_USD          # hard per-clip size ceiling
+    order_warn_usd: float = ORDER_WARN_USD        # above this → loud clamp warning
+    discrepancy_tol_usd: float = DISCREPANCY_TOL_USD   # equity-drift panic band
+    unhedged_grace_sec: float = UNHEDGED_GRACE_SEC     # unhedged-leg grace window
+    reconcile_interval_sec: float = RECONCILE_INTERVAL_SEC  # full-reconcile cadence
+
+
+@dataclass(frozen=True)
+class CircuitBreakerParams:
+    """Trading circuit-breaker thresholds (config.json ``circuit_breaker`` block).
+
+    These are fed straight into the EXISTING ``CircuitBreaker`` constructor — the
+    hardened trip LOGIC is never touched, only its thresholds are externalised so
+    the operator can retune them without editing code.
+    """
+    enabled: bool = True                                 # on by default (live)
+    window_sec: float = CB_WINDOW_SEC
+    max_trades_per_min: int = CB_MAX_TRADES_PER_MIN
+    max_consecutive_losses: int = CB_MAX_CONSECUTIVE_LOSSES
+    max_missed_fill_streak: int = CB_MAX_MISSED_FILL_STREAK
+    missed_fill_min_gap_sec: float = CB_MISSED_FILL_MIN_GAP_SEC
+    edge_window: int = CB_EDGE_WINDOW
+    min_avg_edge_bps: float = CB_MIN_AVG_EDGE_BPS
+
+
+@dataclass(frozen=True)
+class AlertParams:
+    """Discord alert cadences (config.json ``alerts`` block).
+
+    The webhook URL is deliberately NOT here — it stays a secret read from the
+    environment (``DISCORD_WEBHOOK_URL``), never committed to a config file.
+    """
+    summary_interval_sec: float = ALERT_SUMMARY_INTERVAL_SEC  # hourly report cadence
+    ws_debounce_sec: float = ALERT_WS_DEBOUNCE_SEC            # outage alert debounce
+    http_timeout_sec: float = ALERT_HTTP_TIMEOUT_SEC         # per-POST timeout
+    username: str = ALERT_USERNAME                            # webhook display name
+
+
+@dataclass(frozen=True)
+class LivenessParams:
+    """Loop cadences + staleness threshold (config.json ``liveness`` block)."""
+    stale_threshold_sec: float = DEFAULT_STALE_THRESHOLD  # silence → venue "stale"
+    print_interval_sec: float = PRINT_INTERVAL_SEC        # dashboard refresh
+    watchdog_tick_sec: float = WATCHDOG_TICK_SEC          # watchdog poll cadence
+    recv_timeout_sec: float = RECV_TIMEOUT_SEC            # WS read timeout → ping
+
+
+@dataclass(frozen=True)
 class BotConfig:
     """Parsed + validated runtime configuration (mirrors config.json).
 
@@ -513,13 +616,26 @@ class BotConfig:
                            behaviour (any positive net edge trades).
     * ``target_markets`` — canonical symbols to track, resolved against
                            SYMBOL_CATALOG (unknown names dropped with a warning).
+    * ``trade_cooldown_sec`` — post-exit lockout before a symbol may re-enter.
+    * ``taker_fee_per_fill`` — per-fill taker rate used in the edge math.
+    * ``risk`` / ``circuit_breaker`` / ``alerts`` / ``liveness`` — grouped
+                           operator knobs (see the respective *Params dataclass).
+                           Each defaults to today's constants, so an old/partial
+                           config.json behaves identically.
     """
     dry_run: bool = True
     order_size_usd: float = PAPER_STAKE_USD
     min_spread_bps: float = 0.0
+    trade_cooldown_sec: float = TRADE_COOLDOWN_SEC
+    taker_fee_per_fill: float = TAKER_FEE_PER_FILL
     target_markets: tuple = field(
         default_factory=lambda: tuple(s.name for s in TARGET_SYMBOLS))
     realism: "RealismParams" = field(default_factory=RealismParams)
+    risk: "RiskParams" = field(default_factory=RiskParams)
+    circuit_breaker: "CircuitBreakerParams" = field(
+        default_factory=CircuitBreakerParams)
+    alerts: "AlertParams" = field(default_factory=AlertParams)
+    liveness: "LivenessParams" = field(default_factory=LivenessParams)
     source: str = "built-in defaults"     # provenance, for the startup banner
     warnings: tuple = ()                  # non-fatal parse notes (e.g. unknowns)
 
@@ -638,6 +754,137 @@ def _parse_realism(raw: dict) -> "RealismParams":
     )
 
 
+# --- Grouped sub-block validation (risk / circuit_breaker / alerts / liveness)
+# Each shares the same fail-fast discipline as the rest of the loader: a wrong
+# type or out-of-range value raises a clear SystemExit (never a silent default),
+# and an absent block/field falls back to today's constant.
+
+def _sub_block(raw: dict, name: str) -> dict:
+    """Fetch an optional config sub-object; ``{}`` when absent, error if wrong type."""
+    sub = raw.get(name)
+    if sub is None:
+        return {}
+    if not isinstance(sub, dict):
+        raise SystemExit(f"config: '{name}' must be a JSON object.")
+    return sub
+
+
+def _sub_num(sub: dict, block: str, key: str, default: float, *,
+             minimum: "float | None" = 0.0, maximum: "float | None" = None,
+             allow_zero: bool = True) -> float:
+    if key not in sub:
+        return float(default)
+    val = sub[key]
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise SystemExit(f"config: '{block}.{key}' must be a number, got "
+                         f"{type(val).__name__}.")
+    val = float(val)
+    if minimum is not None and val < minimum:
+        raise SystemExit(f"config: '{block}.{key}' must be >= {minimum}, got {val}.")
+    if maximum is not None and val > maximum:
+        raise SystemExit(f"config: '{block}.{key}' must be <= {maximum}, got {val}.")
+    if not allow_zero and val == 0.0:
+        raise SystemExit(f"config: '{block}.{key}' must be greater than 0.")
+    return val
+
+
+def _sub_int(sub: dict, block: str, key: str, default: int, *,
+             minimum: int = 1) -> int:
+    if key not in sub:
+        return int(default)
+    val = sub[key]
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise SystemExit(f"config: '{block}.{key}' must be an integer, got "
+                         f"{type(val).__name__}.")
+    if val < minimum:
+        raise SystemExit(f"config: '{block}.{key}' must be >= {minimum}, got {val}.")
+    return int(val)
+
+
+def _sub_bool(sub: dict, block: str, key: str, default: bool) -> bool:
+    if key not in sub:
+        return bool(default)
+    val = sub[key]
+    if not isinstance(val, bool):
+        raise SystemExit(f"config: '{block}.{key}' must be a boolean (true/false).")
+    return val
+
+
+def _sub_str(sub: dict, block: str, key: str, default: str) -> str:
+    if key not in sub:
+        return str(default)
+    val = sub[key]
+    if not isinstance(val, str):
+        raise SystemExit(f"config: '{block}.{key}' must be a string.")
+    return val
+
+
+def _parse_risk(raw: dict) -> "RiskParams":
+    sub = _sub_block(raw, "risk")
+    return RiskParams(
+        max_order_usd=_sub_num(sub, "risk", "max_order_usd", MAX_ORDER_USD,
+                               allow_zero=False),
+        order_warn_usd=_sub_num(sub, "risk", "order_warn_usd", ORDER_WARN_USD,
+                                allow_zero=False),
+        discrepancy_tol_usd=_sub_num(sub, "risk", "discrepancy_tol_usd",
+                                     DISCREPANCY_TOL_USD, allow_zero=False),
+        unhedged_grace_sec=_sub_num(sub, "risk", "unhedged_grace_sec",
+                                    UNHEDGED_GRACE_SEC, allow_zero=False),
+        reconcile_interval_sec=_sub_num(sub, "risk", "reconcile_interval_sec",
+                                        RECONCILE_INTERVAL_SEC, allow_zero=False),
+    )
+
+
+def _parse_circuit_breaker(raw: dict) -> "CircuitBreakerParams":
+    sub = _sub_block(raw, "circuit_breaker")
+    return CircuitBreakerParams(
+        enabled=_sub_bool(sub, "circuit_breaker", "enabled", True),
+        window_sec=_sub_num(sub, "circuit_breaker", "window_sec", CB_WINDOW_SEC,
+                            allow_zero=False),
+        max_trades_per_min=_sub_int(sub, "circuit_breaker", "max_trades_per_min",
+                                    CB_MAX_TRADES_PER_MIN),
+        max_consecutive_losses=_sub_int(sub, "circuit_breaker",
+                                        "max_consecutive_losses",
+                                        CB_MAX_CONSECUTIVE_LOSSES),
+        max_missed_fill_streak=_sub_int(sub, "circuit_breaker",
+                                        "max_missed_fill_streak",
+                                        CB_MAX_MISSED_FILL_STREAK),
+        missed_fill_min_gap_sec=_sub_num(sub, "circuit_breaker",
+                                         "missed_fill_min_gap_sec",
+                                         CB_MISSED_FILL_MIN_GAP_SEC),
+        edge_window=_sub_int(sub, "circuit_breaker", "edge_window", CB_EDGE_WINDOW),
+        min_avg_edge_bps=_sub_num(sub, "circuit_breaker", "min_avg_edge_bps",
+                                  CB_MIN_AVG_EDGE_BPS),
+    )
+
+
+def _parse_alerts(raw: dict) -> "AlertParams":
+    sub = _sub_block(raw, "alerts")
+    return AlertParams(
+        summary_interval_sec=_sub_num(sub, "alerts", "summary_interval_sec",
+                                      ALERT_SUMMARY_INTERVAL_SEC, allow_zero=False),
+        ws_debounce_sec=_sub_num(sub, "alerts", "ws_debounce_sec",
+                                 ALERT_WS_DEBOUNCE_SEC),
+        http_timeout_sec=_sub_num(sub, "alerts", "http_timeout_sec",
+                                  ALERT_HTTP_TIMEOUT_SEC, allow_zero=False),
+        username=_sub_str(sub, "alerts", "username", ALERT_USERNAME),
+    )
+
+
+def _parse_liveness(raw: dict) -> "LivenessParams":
+    sub = _sub_block(raw, "liveness")
+    return LivenessParams(
+        stale_threshold_sec=_sub_num(sub, "liveness", "stale_threshold_sec",
+                                     DEFAULT_STALE_THRESHOLD, allow_zero=False),
+        print_interval_sec=_sub_num(sub, "liveness", "print_interval_sec",
+                                    PRINT_INTERVAL_SEC, allow_zero=False),
+        watchdog_tick_sec=_sub_num(sub, "liveness", "watchdog_tick_sec",
+                                   WATCHDOG_TICK_SEC, allow_zero=False),
+        recv_timeout_sec=_sub_num(sub, "liveness", "recv_timeout_sec",
+                                  RECV_TIMEOUT_SEC, allow_zero=False),
+    )
+
+
 def _config_from_dict(raw: dict, source: str) -> "BotConfig":
     """Validate a raw config dict → ``BotConfig`` (used by both the file loader
     and the editor, so an in-memory edit is checked with identical rules before
@@ -653,15 +900,29 @@ def _config_from_dict(raw: dict, source: str) -> "BotConfig":
     order_size = _cfg_number(raw, "order_size_usd", PAPER_STAKE_USD,
                              minimum=0.0, allow_zero=False)
     min_spread = _cfg_number(raw, "min_spread_bps", 0.0, minimum=0.0)
+    cooldown = _cfg_number(raw, "trade_cooldown_sec", TRADE_COOLDOWN_SEC,
+                           minimum=0.0)
+    taker_fee = _cfg_number(raw, "taker_fee_per_fill", TAKER_FEE_PER_FILL,
+                            minimum=0.0, allow_zero=False)
     markets, warnings = _resolve_markets(raw)
     realism = _parse_realism(raw)
+    risk = _parse_risk(raw)
+    circuit_breaker = _parse_circuit_breaker(raw)
+    alerts = _parse_alerts(raw)
+    liveness = _parse_liveness(raw)
 
     return BotConfig(
         dry_run=dry_run,
         order_size_usd=order_size,
         min_spread_bps=min_spread,
+        trade_cooldown_sec=cooldown,
+        taker_fee_per_fill=taker_fee,
         target_markets=markets,
         realism=realism,
+        risk=risk,
+        circuit_breaker=circuit_breaker,
+        alerts=alerts,
+        liveness=liveness,
         source=source,
         warnings=tuple(warnings),
     )
@@ -696,13 +957,33 @@ def load_config(path: str = CONFIG_PATH) -> "BotConfig":
 REALISM_EFFECTS = ("slippage", "latency", "missed_fills", "partial_fills",
                    "leg_failure", "funding")
 
-_TOP_KEYS = {"dry_run", "order_size_usd", "min_spread_bps", "target_markets"}
+_TOP_KEYS = {"dry_run", "order_size_usd", "min_spread_bps", "target_markets",
+             "trade_cooldown_sec", "taker_fee_per_fill"}
 _REALISM_KEYS = ({"enabled", "seed", "slippage_bps", "slippage_mult",
                   "impact_bps_per_10k",
                   "latency_ms", "latency_adverse_bps", "fill_probability",
                   "partial_fill_prob", "partial_fill_min_ratio",
                   "leg_failure_prob", "funding_rate_8h_bps"}
                  | set(REALISM_EFFECTS))
+_RISK_KEYS = {"max_order_usd", "order_warn_usd", "discrepancy_tol_usd",
+              "unhedged_grace_sec", "reconcile_interval_sec"}
+_CB_KEYS = {"enabled", "window_sec", "max_trades_per_min",
+            "max_consecutive_losses", "max_missed_fill_streak",
+            "missed_fill_min_gap_sec", "edge_window", "min_avg_edge_bps"}
+_ALERT_KEYS = {"summary_interval_sec", "ws_debounce_sec", "http_timeout_sec",
+               "username"}
+_LIVENESS_KEYS = {"stale_threshold_sec", "print_interval_sec",
+                  "watchdog_tick_sec", "recv_timeout_sec"}
+
+# Dotted ``<section>.<field>`` edits route through here. ``realism`` keeps its
+# own toggle helpers but is listed so the editor recognises realism.<field> too.
+_SECTION_KEYS = {
+    "realism": _REALISM_KEYS,
+    "risk": _RISK_KEYS,
+    "circuit_breaker": _CB_KEYS,
+    "alerts": _ALERT_KEYS,
+    "liveness": _LIVENESS_KEYS,
+}
 
 
 def _default_config_dict() -> dict:
@@ -711,7 +992,38 @@ def _default_config_dict() -> dict:
         "dry_run": True,
         "order_size_usd": PAPER_STAKE_USD,
         "min_spread_bps": 1.0,
+        "trade_cooldown_sec": TRADE_COOLDOWN_SEC,
+        "taker_fee_per_fill": TAKER_FEE_PER_FILL,
         "target_markets": [s.name for s in TARGET_SYMBOLS],
+        "risk": {
+            "max_order_usd": MAX_ORDER_USD,
+            "order_warn_usd": ORDER_WARN_USD,
+            "discrepancy_tol_usd": DISCREPANCY_TOL_USD,
+            "unhedged_grace_sec": UNHEDGED_GRACE_SEC,
+            "reconcile_interval_sec": RECONCILE_INTERVAL_SEC,
+        },
+        "circuit_breaker": {
+            "enabled": True,
+            "window_sec": CB_WINDOW_SEC,
+            "max_trades_per_min": CB_MAX_TRADES_PER_MIN,
+            "max_consecutive_losses": CB_MAX_CONSECUTIVE_LOSSES,
+            "max_missed_fill_streak": CB_MAX_MISSED_FILL_STREAK,
+            "missed_fill_min_gap_sec": CB_MISSED_FILL_MIN_GAP_SEC,
+            "edge_window": CB_EDGE_WINDOW,
+            "min_avg_edge_bps": CB_MIN_AVG_EDGE_BPS,
+        },
+        "alerts": {
+            "summary_interval_sec": ALERT_SUMMARY_INTERVAL_SEC,
+            "ws_debounce_sec": ALERT_WS_DEBOUNCE_SEC,
+            "http_timeout_sec": ALERT_HTTP_TIMEOUT_SEC,
+            "username": ALERT_USERNAME,
+        },
+        "liveness": {
+            "stale_threshold_sec": DEFAULT_STALE_THRESHOLD,
+            "print_interval_sec": PRINT_INTERVAL_SEC,
+            "watchdog_tick_sec": WATCHDOG_TICK_SEC,
+            "recv_timeout_sec": RECV_TIMEOUT_SEC,
+        },
         "realism": {
             "enabled": True,
             "slippage": True, "latency": True, "missed_fills": True,
@@ -735,21 +1047,31 @@ def _parse_set_value(text: str):
 
 
 def _apply_set(raw: dict, key: str, value) -> None:
-    """Apply one ``KEY=VALUE`` edit to the raw dict (dotted ``realism.*`` keys)."""
-    if key.startswith("realism."):
-        sub = key.split(".", 1)[1]
-        if sub not in _REALISM_KEYS:
-            raise SystemExit(f"config: unknown field 'realism.{sub}'. "
-                             f"Known: {sorted(_REALISM_KEYS)}")
-        raw.setdefault("realism", {})[sub] = value
+    """Apply one ``KEY=VALUE`` edit to the raw dict.
+
+    Top-level keys (``order_size_usd`` …) set directly; dotted
+    ``<section>.<field>`` keys (``circuit_breaker.max_trades_per_min``,
+    ``risk.max_order_usd``, ``alerts.username``, ``realism.slippage_bps`` …) set
+    a field inside the named section. Unknown sections/fields fail fast.
+    """
+    if "." in key:
+        section, sub = key.split(".", 1)
+        if section not in _SECTION_KEYS:
+            raise SystemExit(f"config: unknown section '{section}'. Known "
+                             f"sections: {sorted(_SECTION_KEYS)}.")
+        if sub not in _SECTION_KEYS[section]:
+            raise SystemExit(f"config: unknown field '{section}.{sub}'. "
+                             f"Known: {sorted(_SECTION_KEYS[section])}")
+        raw.setdefault(section, {})[sub] = value
     elif key in _TOP_KEYS:
         raw[key] = value
-    elif key == "realism":
-        raise SystemExit("config: edit a specific field, e.g. "
-                         "realism.slippage_bps, not 'realism' wholesale.")
+    elif key in _SECTION_KEYS:
+        raise SystemExit(f"config: edit a specific field, e.g. "
+                         f"{key}.<field>, not '{key}' wholesale.")
     else:
         raise SystemExit(f"config: unknown key '{key}'. Known: "
-                         f"{sorted(_TOP_KEYS)} or realism.<field>.")
+                         f"{sorted(_TOP_KEYS)} or <section>.<field> for "
+                         f"sections {sorted(_SECTION_KEYS)}.")
 
 
 def _toggle_effect(raw: dict, eff: str, on: bool) -> None:
@@ -777,11 +1099,29 @@ def _print_config(cfg: "BotConfig") -> None:
     print(f" source          : {cfg.source}")
     print(f" dry_run         : {cfg.dry_run}   "
           f"({'SIMULATION' if cfg.dry_run else 'LIVE'})")
-    capped_note = (f"  → CLAMPED to {MAX_ORDER_USD:.2f} (hard ceiling)"
-                   if cfg.order_size_usd > MAX_ORDER_USD else "")
+    rk, cb, al, lv = cfg.risk, cfg.circuit_breaker, cfg.alerts, cfg.liveness
+    capped_note = (f"  → CLAMPED to {rk.max_order_usd:.2f} (hard ceiling)"
+                   if cfg.order_size_usd > rk.max_order_usd else "")
     print(f" order_size_usd  : {cfg.order_size_usd:,.2f}{capped_note}")
     print(f" min_spread_bps  : {cfg.min_spread_bps:.2f}")
-    print(f" target_markets  : {', '.join(cfg.target_markets)}")
+    print(f" trade_cooldown  : {cfg.trade_cooldown_sec:.2f}s")
+    print(f" taker_fee/fill  : {cfg.taker_fee_per_fill*100:.4f}%  "
+          f"(round-trip per leg {cfg.taker_fee_per_fill*2*100:.4f}%)")
+    print(f" target_markets  : {', '.join(cfg.target_markets)} "
+          f"({len(cfg.target_markets)})")
+    print(f" risk            : size cap ${rk.max_order_usd:.2f} "
+          f"(warn ${rk.order_warn_usd:.2f}) · recon tol ${rk.discrepancy_tol_usd:.2f}"
+          f"/{rk.reconcile_interval_sec:.0f}s · unhedged grace {rk.unhedged_grace_sec:.0f}s")
+    print(f" circuit_breaker : {on(cb.enabled)} {cb.max_trades_per_min} trades/"
+          f"{cb.window_sec:.0f}s · {cb.max_consecutive_losses} losses · "
+          f"{cb.max_missed_fill_streak} missed (≥{cb.missed_fill_min_gap_sec:.0f}s) · "
+          f"edge floor {cb.min_avg_edge_bps:.2f}bps/{cb.edge_window}")
+    print(f" alerts          : summary {al.summary_interval_sec:.0f}s · "
+          f"ws debounce {al.ws_debounce_sec:.0f}s · timeout {al.http_timeout_sec:.0f}s "
+          f"· user '{al.username}'")
+    print(f" liveness        : stale {lv.stale_threshold_sec:.0f}s · "
+          f"print {lv.print_interval_sec:.1f}s · watchdog {lv.watchdog_tick_sec:.1f}s "
+          f"· recv timeout {lv.recv_timeout_sec:.0f}s")
     print(f" realism.enabled : {on(rp.enabled)} (master)")
     print(f"   {'slippage':<14}{on(rp.slippage)}  "
           f"{rp.slippage_bps:.2f}×{rp.slippage_mult:.2f}"
@@ -814,10 +1154,15 @@ def _config_cli(argv) -> int:
                     "per-effect realism toggles (no hand-editing JSON).",
         epilog="examples:\n"
                "  config --show\n"
-               "  config --set realism.slippage_bps=2.5 --set order_size_usd=250\n"
+               "  config --set order_size_usd=250 --set min_spread_bps=2.0\n"
+               "  config --set circuit_breaker.max_trades_per_min=50\n"
+               "  config --set risk.max_order_usd=25 --set liveness.stale_threshold_sec=20\n"
+               "  config --set realism.slippage_bps=2.5\n"
                "  config --disable funding --disable partial_fills\n"
-               "  config --enable realism   # master switch on\n"
-               "  config --init             # write a default config.json",
+               "  config --enable realism   # realism master switch on\n"
+               "  config --init             # write a default config.json\n"
+               "\nsections: risk.<f>, circuit_breaker.<f>, alerts.<f>, "
+               "liveness.<f>, realism.<f>",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", default=CONFIG_PATH, metavar="PATH",
                    help=f"config file to view/edit (default: {CONFIG_PATH}).")
@@ -1891,6 +2236,11 @@ class Portfolio:
                  circuit_breaker_enabled: bool = False,
                  max_trades_per_min: int = CB_MAX_TRADES_PER_MIN,
                  max_consecutive_losses: int = CB_MAX_CONSECUTIVE_LOSSES,
+                 cb_window_sec: float = CB_WINDOW_SEC,
+                 cb_max_missed_fill_streak: int = CB_MAX_MISSED_FILL_STREAK,
+                 cb_miss_min_gap_sec: float = CB_MISSED_FILL_MIN_GAP_SEC,
+                 cb_edge_window: int = CB_EDGE_WINDOW,
+                 cb_min_avg_edge_bps: float = CB_MIN_AVG_EDGE_BPS,
                  notifier: "AlertNotifier | None" = None) -> None:
         self.specs = list(specs)
         self.stake = stake
@@ -1900,11 +2250,18 @@ class Portfolio:
         self.notifier = notifier                      # async alert sink (or None)
         # ONE portfolio-wide circuit breaker, shared by every symbol gate, so a
         # losing streak or runaway rate ANYWHERE trips a single global halt.
-        # Disabled by default (tests/ad-hoc); ``run_live`` enables it.
+        # Disabled by default (tests/ad-hoc); ``run_live`` enables it. All
+        # thresholds are forwarded straight into the breaker's own constructor —
+        # its trip logic is unchanged; only the tuning values flow from config.
         self.breaker = CircuitBreaker(
             self, enabled=circuit_breaker_enabled,
             max_trades_per_min=max_trades_per_min,
-            max_consecutive_losses=max_consecutive_losses)
+            max_consecutive_losses=max_consecutive_losses,
+            window_sec=cb_window_sec,
+            max_missed_fill_streak=cb_max_missed_fill_streak,
+            miss_min_gap_sec=cb_miss_min_gap_sec,
+            edge_window=cb_edge_window,
+            min_avg_edge_bps=cb_min_avg_edge_bps)
         self.engines = {}
         for i, spec in enumerate(self.specs):
             state = PerpBookState(spec)
@@ -1958,41 +2315,48 @@ class Portfolio:
 # WebSocket streams (isolated transport — no execution logic lives here)
 # ---------------------------------------------------------------------------
 
-def parse_binance_book(raw):
+def parse_binance_book(raw, scale: float = 1.0):
     """Binance @bookTicker frame -> (bid, ask), or None if not a book frame.
 
     Pure: pulls best bid from ``msg['b']`` and best ask from ``msg['a']``.
+    ``scale`` renormalises a bundled contract (e.g. 1000PEPEUSDT → /1000) to the
+    per-token unit shared with the other venues; default 1.0 is a no-op.
     """
     msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
     bid, ask = msg.get("b"), msg.get("a")
     if bid is None or ask is None:
         return None
-    return float(bid), float(ask)
+    return float(bid) / scale, float(ask) / scale
 
 
-def parse_bybit_book(raw, prev_bid: float = 0.0, prev_ask: float = 0.0):
+def parse_bybit_book(raw, prev_bid: float = 0.0, prev_ask: float = 0.0,
+                     scale: float = 1.0):
     """Bybit orderbook.1 frame -> (bid, ask), or None for non-book frames.
 
     Pure: pulls best bid from ``data['b'][0][0]`` and best ask from
     ``data['a'][0][0]``. A delta that omits one side keeps the prior level
-    (``prev_bid`` / ``prev_ask``). Subscribe acks / pongs return None.
+    (``prev_bid`` / ``prev_ask`` — already in canonical units). ``scale``
+    renormalises a bundled contract's FRESH side to the per-token unit (default
+    1.0 is a no-op). Subscribe acks / pongs return None.
     """
     msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
     data = msg.get("data")
     if not data or "orderbook" not in str(msg.get("topic", "")):
         return None
     bids, asks = data.get("b") or [], data.get("a") or []
-    bid = float(bids[0][0]) if bids else prev_bid
-    ask = float(asks[0][0]) if asks else prev_ask
+    bid = float(bids[0][0]) / scale if bids else prev_bid
+    ask = float(asks[0][0]) / scale if asks else prev_ask
     return bid, ask
 
 
-def parse_okx_book(raw, prev_bid: float = 0.0, prev_ask: float = 0.0):
+def parse_okx_book(raw, prev_bid: float = 0.0, prev_ask: float = 0.0,
+                   scale: float = 1.0):
     """OKX bbo-tbt frame -> (bid, ask), or None for non-book frames.
 
     Pure: pulls best bid from ``data[0]['bids'][0][0]`` and best ask from
     ``data[0]['asks'][0][0]``. Subscribe/error events and the literal "pong"
-    keepalive return None; a side-only update keeps the prior level.
+    keepalive return None; a side-only update keeps the prior level. ``scale``
+    renormalises a bundled contract's FRESH side (default 1.0 is a no-op).
     """
     try:
         msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
@@ -2005,8 +2369,8 @@ def parse_okx_book(raw, prev_bid: float = 0.0, prev_ask: float = 0.0):
         return None
     top = data[0]
     bids, asks = top.get("bids") or [], top.get("asks") or []
-    bid = float(bids[0][0]) if bids else prev_bid
-    ask = float(asks[0][0]) if asks else prev_ask
+    bid = float(bids[0][0]) / scale if bids else prev_bid
+    ask = float(asks[0][0]) / scale if asks else prev_ask
     return bid, ask
 
 
@@ -2097,9 +2461,11 @@ async def stream_binance(portfolio: "Portfolio", stop: asyncio.Event) -> None:
                 sym = portfolio.binance_map.get(stream.split("@")[0])
                 if sym is None:
                     continue
-                book = parse_binance_book(data)   # data carries b / a
+                eng = portfolio.engines[sym]
+                # Normalise a bundled contract (e.g. 1000PEPEUSDT) to per-token.
+                book = parse_binance_book(data, eng.spec.binance_scale)
                 if book is not None:
-                    portfolio.engines[sym].state.update("binance", book[0], book[1])
+                    eng.state.update("binance", book[0], book[1])
 
     await _run_stream_with_reconnect(
         "Binance", stop, session,
@@ -2137,8 +2503,10 @@ async def stream_bybit(portfolio: "Portfolio", stop: asyncio.Event) -> None:
                 if sym is None:
                     continue
                 st = portfolio.engines[sym].state
-                # A side-only delta keeps THIS symbol's prior level.
-                book = parse_bybit_book(msg, st.bybit.bid, st.bybit.ask)
+                # A side-only delta keeps THIS symbol's prior (canonical) level;
+                # the fresh side is renormalised by the per-venue scale.
+                book = parse_bybit_book(msg, st.bybit.bid, st.bybit.ask,
+                                        st.spec.bybit_scale)
                 if book is not None and book[0] > 0 and book[1] > 0:
                     st.update("bybit", book[0], book[1])
 
@@ -2175,7 +2543,8 @@ async def stream_okx(portfolio: "Portfolio", stop: asyncio.Event) -> None:
                 if sym is None:
                     continue
                 st = portfolio.engines[sym].state
-                book = parse_okx_book(msg, st.okx.bid, st.okx.ask)
+                book = parse_okx_book(msg, st.okx.bid, st.okx.ask,
+                                      st.spec.okx_scale)
                 if book is not None and book[0] > 0 and book[1] > 0:
                     st.update("okx", book[0], book[1])
 
@@ -2312,17 +2681,10 @@ class StalenessWatchdog:
 # than pretend to move real money — so enabling --live screams for a real
 # signed-request implementation instead of silently doing the wrong thing.
 # ---------------------------------------------------------------------------
-
-# Virtual starting equity used as the reconciliation baseline (USD).
-INITIAL_EQUITY_USD = PAPER_STAKE_USD
-# Equity drift beyond this (live vs. internal ledger) triggers a panic.
-DISCREPANCY_TOL_USD = 5.0
-# An unhedged single leg exposed longer than this (seconds) triggers a panic.
-UNHEDGED_GRACE_SEC = 5.0
-# Full equity reconciliation cadence (seconds).
-RECONCILE_INTERVAL_SEC = 60.0
-# Fast tick for the unhedged-leg check (must be << UNHEDGED_GRACE_SEC).
-RECON_TICK_SEC = 1.0
+# (The reconciliation thresholds — INITIAL_EQUITY_USD, DISCREPANCY_TOL_USD,
+# UNHEDGED_GRACE_SEC, RECONCILE_INTERVAL_SEC, RECON_TICK_SEC — are defined up in
+# the configuration-constants block near the top of the file so the config
+# dataclasses can default to them.)
 
 
 def send_alert(message: str) -> None:
@@ -2711,12 +3073,44 @@ def _print_session_summary(portfolio: "Portfolio",
 # Orchestration: boot streams + gate + watchdog + printer, run until stopped
 # ---------------------------------------------------------------------------
 
+def _apply_runtime_overrides(config: "BotConfig") -> None:
+    """Push config-driven values onto the module-level runtime constants that the
+    hot path reads as globals — taker fee, post-exit cooldown, the hard size cap,
+    and the loop/stream cadences. Called ONCE at startup (before any engine or
+    stream is built) so a JSON edit retunes them without threading every call
+    site or mutating any function signature.
+
+    Scope note: the circuit-breaker and alerting SUBSYSTEMS are intentionally NOT
+    touched here — they are configured purely via their own constructor
+    parameters (Portfolio → CircuitBreaker, StalenessWatchdog, AlertNotifier,
+    ReconciliationGuard), so their hardened logic is never modified.
+    """
+    global TAKER_FEE_PER_FILL, TAKER_FEE, TRADE_COOLDOWN_SEC
+    global MAX_ORDER_USD, ORDER_WARN_USD
+    global PRINT_INTERVAL_SEC, WATCHDOG_TICK_SEC, RECV_TIMEOUT_SEC
+    TAKER_FEE_PER_FILL = config.taker_fee_per_fill
+    TAKER_FEE = 2.0 * TAKER_FEE_PER_FILL          # entry + exit ⇒ round-trip/leg
+    TRADE_COOLDOWN_SEC = config.trade_cooldown_sec
+    MAX_ORDER_USD = config.risk.max_order_usd
+    ORDER_WARN_USD = config.risk.order_warn_usd
+    PRINT_INTERVAL_SEC = config.liveness.print_interval_sec
+    WATCHDOG_TICK_SEC = config.liveness.watchdog_tick_sec
+    RECV_TIMEOUT_SEC = config.liveness.recv_timeout_sec
+
+
 async def run_live(config: "BotConfig",
-                   stale_threshold: float = DEFAULT_STALE_THRESHOLD,
+                   stale_threshold: "float | None" = None,
                    force_live: bool = False) -> None:
+    # Apply config-driven runtime constants FIRST, so every banner line, engine,
+    # gate and stream below sees the configured values (not the import defaults).
+    _apply_runtime_overrides(config)
     # dry_run is the canonical safety switch (config-driven); the CLI --live flag
     # is an explicit operator override on top of it.
     live = force_live or (not config.dry_run)
+    # Stale threshold: CLI --stale-threshold wins when given, else the config's
+    # liveness.stale_threshold_sec (which itself defaults to the old constant).
+    if stale_threshold is None:
+        stale_threshold = config.liveness.stale_threshold_sec
     specs = config.specs
     mode = (RED + "LIVE (authenticated)" + RESET) if live else "SIMULATION (dry-run)"
     symbols = ", ".join(s.name for s in specs)
@@ -2749,14 +3143,16 @@ async def run_live(config: "BotConfig",
     print(f" Taker buffer {TAKER_FEE_PER_FILL*1e2:.2f}%/fill (entry+exit ⇒ "
           f"{TAKER_FEE*1e2:.2f}% round-trip per leg) · "
           f"stale flag after {stale_threshold:0.0f}s of silence")
+    cb = config.circuit_breaker
+    cb_state = "" if cb.enabled else " (DISABLED)"
     size_note = (f"  ⚠ order ${config.order_size_usd:,.2f} > ceiling — every "
                  f"clip clamped to ${MAX_ORDER_USD:.2f}"
                  if config.order_size_usd > MAX_ORDER_USD else "")
-    print(f" Guardrails: size cap ${MAX_ORDER_USD:.2f}/clip · circuit breaker "
-          f"{CB_MAX_TRADES_PER_MIN} trades/{CB_WINDOW_SEC:.0f}s · "
-          f"{CB_MAX_CONSECUTIVE_LOSSES} losses · {CB_MAX_MISSED_FILL_STREAK} "
-          f"missed-fill streak · edge floor {CB_MIN_AVG_EDGE_BPS:.1f}bps/"
-          f"{CB_EDGE_WINDOW} → halt{size_note}")
+    print(f" Guardrails: size cap ${MAX_ORDER_USD:.2f}/clip · circuit breaker"
+          f"{cb_state} {cb.max_trades_per_min} trades/{cb.window_sec:.0f}s · "
+          f"{cb.max_consecutive_losses} losses · {cb.max_missed_fill_streak} "
+          f"missed-fill streak · edge floor {cb.min_avg_edge_bps:.1f}bps/"
+          f"{cb.edge_window} → halt{size_note}")
     print("=" * 70)
     for w in config.warnings:
         print(YELLOW + f"[{_ts()}] ⚠️  config: {w}" + RESET)
@@ -2799,25 +3195,38 @@ async def run_live(config: "BotConfig",
           f"(append-only, flushed per trade)")
 
     # Async Discord alerter — active iff DISCORD_WEBHOOK_URL is set. The URL is
-    # a secret and is NEVER printed; we only report enabled/disabled.
-    notifier = load_alert_notifier()
+    # a secret and is NEVER printed; we only report enabled/disabled. Display
+    # name + POST timeout come from the config's ``alerts`` block.
+    notifier = load_alert_notifier(username=config.alerts.username,
+                                   timeout=config.alerts.http_timeout_sec)
     print(f"[{_ts()}] 🔔 Discord alerts: "
           + (GREEN + "ENABLED ✓" + RESET if notifier.enabled
              else f"disabled (set {ALERT_WEBHOOK_ENV} to enable)"))
 
     # One isolated engine per symbol (book + ledger + gate, per-symbol locks).
-    # Trade size, the spread hurdle, and the execution-realism model all come
-    # straight from the config.
+    # Trade size, the spread hurdle, the execution-realism model, and every
+    # circuit-breaker threshold all come straight from the config.
     portfolio = Portfolio(specs, config.order_size_usd, logger=trade_logger,
                           min_spread_bps=config.min_spread_bps,
                           realism=config.realism,
-                          circuit_breaker_enabled=True,
+                          circuit_breaker_enabled=cb.enabled,
+                          max_trades_per_min=cb.max_trades_per_min,
+                          max_consecutive_losses=cb.max_consecutive_losses,
+                          cb_window_sec=cb.window_sec,
+                          cb_max_missed_fill_streak=cb.max_missed_fill_streak,
+                          cb_miss_min_gap_sec=cb.missed_fill_min_gap_sec,
+                          cb_edge_window=cb.edge_window,
+                          cb_min_avg_edge_bps=cb.min_avg_edge_bps,
                           notifier=notifier)
-    watchdog = StalenessWatchdog(portfolio, stale_threshold, notifier=notifier)
+    watchdog = StalenessWatchdog(portfolio, stale_threshold, notifier=notifier,
+                                 alert_debounce=config.alerts.ws_debounce_sec)
     portfolio.wire_ws_frame(watchdog.on_ws_frame)   # instant stale stand-down
     brokers = build_brokers(creds, portfolio, live,
                             initial_equity=config.order_size_usd)
     guard = ReconciliationGuard(portfolio, brokers, live=live,
+                                interval=config.risk.reconcile_interval_sec,
+                                unhedged_grace=config.risk.unhedged_grace_sec,
+                                discrepancy_tol=config.risk.discrepancy_tol_usd,
                                 initial_equity=config.order_size_usd,
                                 notifier=notifier)
 
@@ -2833,10 +3242,12 @@ async def run_live(config: "BotConfig",
         asyncio.create_task(guard.loop(stop), name="reconcile"),
         asyncio.create_task(_dashboard_loop(portfolio, stop), name="dashboard"),
     ]
-    # Hourly trade/PnL summary → Discord (only when alerting is active).
+    # Hourly trade/PnL summary → Discord (only when alerting is active). The
+    # cadence comes from the config's ``alerts`` block.
     if notifier.enabled:
         tasks.append(asyncio.create_task(
-            _hourly_report_loop(portfolio, notifier, stop, started_at),
+            _hourly_report_loop(portfolio, notifier, stop, started_at,
+                                interval=config.alerts.summary_interval_sec),
             name="hourly-report"))
 
     # Lifecycle alert: the bot is online.
@@ -2850,9 +3261,9 @@ async def run_live(config: "BotConfig",
                 ("Order size",
                  f"${config.order_size_usd:,.2f} (cap ${MAX_ORDER_USD:.2f})", True),
                 ("Guardrails",
-                 f"CB {CB_MAX_TRADES_PER_MIN}/{CB_WINDOW_SEC:.0f}s · "
-                 f"{CB_MAX_CONSECUTIVE_LOSSES}L · {CB_MAX_MISSED_FILL_STREAK}MF · "
-                 f"edge {CB_MIN_AVG_EDGE_BPS:.1f}bps", True)])
+                 f"CB {cb.max_trades_per_min}/{cb.window_sec:.0f}s · "
+                 f"{cb.max_consecutive_losses}L · {cb.max_missed_fill_streak}MF · "
+                 f"edge {cb.min_avg_edge_bps:.1f}bps", True)])
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -2893,10 +3304,11 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument(
         "--stale-threshold",
         type=float,
-        default=DEFAULT_STALE_THRESHOLD,
+        default=None,
         metavar="SECONDS",
-        help="Seconds of WebSocket silence before a venue is flagged stale "
-             f"(default: {DEFAULT_STALE_THRESHOLD:0.0f}).",
+        help="Seconds of WebSocket silence before a venue is flagged stale. "
+             "Overrides the config's liveness.stale_threshold_sec when given "
+             f"(config default: {DEFAULT_STALE_THRESHOLD:0.0f}).",
     )
     p.add_argument(
         "--live",
@@ -2918,7 +3330,7 @@ def main() -> None:
         raise SystemExit(_config_cli(argv[1:]))
 
     args = _parse_args(argv)
-    if args.stale_threshold <= 0:
+    if args.stale_threshold is not None and args.stale_threshold <= 0:
         raise SystemExit("--stale-threshold must be a positive number of seconds.")
     if not _HAS_WEBSOCKETS:
         raise SystemExit(
